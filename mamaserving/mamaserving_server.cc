@@ -1,10 +1,10 @@
 #include "ModelSliceReader.h"
 #include "alimama.grpc.pb.h"
 #include "alimama.pb.h"
-#include "collab.grpc.pb.h"
-#include "collab.pb.h"
-#include "hdfs.h"
+#include "ourmama.grpc.pb.h"
+#include "ourmama.pb.h"
 #include <arpa/inet.h>
+#include <boost/format.hpp>
 #include <boost/log/core.hpp>
 #include <boost/log/expressions.hpp>
 #include <boost/log/sinks/text_file_backend.hpp>
@@ -25,10 +25,12 @@
 #include <grpcpp/ext/proto_server_reflection_plugin.h>
 #include <grpcpp/grpcpp.h>
 #include <grpcpp/health_check_service_interface.h>
+#include <hdfs/hdfs.h>
 #include <ifaddrs.h>
 #include <iostream>
 #include <memory>
 #include <netinet/in.h>
+#include <queue>
 #include <sys/socket.h>
 #include <thread>
 
@@ -63,50 +65,52 @@ constexpr int queryInterval = 1000; // microseconds
 const std::string etcdUrl = "http://etcd:2379";
 const std::string etcdPublishTaskPrefix = "/tasks/";
 const std::string etcdFinishTaskPrefix = "/finished/";
-const std::string etcdIntraDiscoveryFmt =
-    "/intra/%1%" const std::string etcdServiceDiscoveryFmt =
-        "/service/modeling/%1%";
+const std::string etcdIntraDiscoveryFmt = "/intra/%1%";
+const std::string etcdServiceDiscoveryFmt = "/service/modeling/%1%";
 const std::string etcdVersionSyncFolderFmt = "/version/%1%/";
 const std::string etcdVersionSyncNodeFmt = "/version/%1%/%2%";
 
 bool gIsExiting = false;
 int gNodeId;
 int gNodeNum;
-vector<std::string> gNodeIps;
+std::string gNodeIp;
+std::vector<std::string> gNodeIps;
+
+#define FMT(fmt, ...) boost::str(boost::format(fmt) % __VA_ARGS__)
 
 class SliceCache {
 private:
   std::string targetPath(int slice) {
-    return boost::format("./model_slice.%03d%") % slice;
+    return FMT("./model_slice.%03d%", slice);
   }
 
 public:
-  std::string version;
-  int start;
-  int cnt;
-  vector<ModelSliceReader *> readers;
+  const std::string Version_;
+  int start_;
+  int cnt_;
+  std::vector<ModelSliceReader *> readers_;
 
-  SliceCache(std::string version) : version(version) {}
+  SliceCache(std::string version) : Version_(version) {}
 
   void Load() {
-    readers.resize(cnt);
-    for (int i = 0; i < cnt; i++) {
-      readers[i] = new ModelSliceReader();
-      readers[i]->Load(targetPath(start + i));
+    readers_.resize(cnt_);
+    for (int i = 0; i < cnt_; i++) {
+      readers_[i] = new ModelSliceReader();
+      readers_[i]->Load(targetPath(start_ + i));
     }
   }
 
-  bool Has(int slice) { return slice >= start && slice < start + cnt; }
+  bool Has(int slice) { return slice >= start_ && slice < start_ + cnt_; }
 
   void Unload() {
-    for (auto reader : readers) {
+    for (auto reader : readers_) {
       reader->Unload();
       delete reader;
     }
   }
 
   void Read(int slice, size_t seek, size_t len, char *buffer) {
-    readers[slice - start]->Read(seek, len, buffer);
+    readers_[slice - start_]->Read(seek, len, buffer);
   }
 };
 
@@ -156,8 +160,8 @@ public:
 
   bool IsSliceDownloaded(std::string version, int slice) {
     std::unique_lock<std::mutex> lock(mutex_);
-    auto &versionRecord = ivr_[version];
-    return versionRecord.find(slice) != versionRecord.end();
+    auto &fins = ivr_[version].finishedSlices;
+    return fins.find(slice) != fins.end();
   }
 
   bool IsVersionDownloaded(std::string version) {
@@ -168,14 +172,14 @@ public:
   void RecordVersionNeedDownload(std::string version, int slice_count,
                                  std::condition_variable *cv) {
     std::unique_lock<std::mutex> lock(mutex_);
-    version_need_slice_count_[version] = slice_count;
+    ivr_[version].requiredSlices = slice_count;
     versionCv_[version] = cv;
   }
 
 private:
   struct InternalVersionRecord {
     int requiredSlices;
-    std::ordered_set<int> finishedSlices;
+    std::unordered_set<int> finishedSlices;
 
     bool finished() { return requiredSlices == finishedSlices.size(); }
   };
@@ -188,6 +192,12 @@ private:
 
 // we use a thread pool to download file from hdfs to control resouce usage
 class DownloadThreadPool {
+private:
+  struct HdfsModelPath {
+    std::string version;
+    uint64_t slice;
+  };
+
 public:
   DownloadThreadPool(size_t num_threads, VersionDownloadInfo *pDownloadInfo)
       : stop_(false), pDownloadInfo_(pDownloadInfo) {
@@ -197,7 +207,7 @@ public:
 
   ~DownloadThreadPool() {
     {
-      std::unique_lock<std::mutex> lock(queue_mutex_);
+      std::unique_lock<std::mutex> lock(queueMutex_);
       stop_ = true;
     }
     condition_.notify_all();
@@ -206,9 +216,9 @@ public:
   }
 
   void DownloadSliceFromHdfs(std::string version, int slice) {
-    std::string command =
-        boost::format("%1%/bin/hadoop fs -get /root/model-%2%/slice-%3% .") %
-        HADOOP_PATH % version % slice;
+    std::string command = FMT("/opt/hadoop-3.3.1/bin/hadoop fs -get "
+                              "/model-%1%/slice-%2% .",
+                              version % slice);
     system(command.c_str());
     pDownloadInfo_->RecordDownloadedSlice(version, slice);
   }
@@ -240,14 +250,16 @@ public:
     tasks_.emplace(version, slice);
   }
 
-private:
+  // Harlan: I moved it to public since it is accessed in a lambda function,
+  // and with GCC's impl of C++ 11 lambda, it can't access private members.
   std::queue<HdfsModelPath> tasks_;
+
+private:
   std::vector<std::thread> workers_;
   std::mutex queueMutex_;
   std::condition_variable condition_;
   bool stop_;
   VersionDownloadInfo *pDownloadInfo_;
-
 }; // class DownLoadThreadPool
 
 class EtcdService {
@@ -268,10 +280,10 @@ private:
     CHECK_IF_SUCCEEDED(key, "set");
   }
 
-  static void del(std::string key) {
+  static void rm(std::string key) {
     etcd::Client client(etcdUrl);
-    auto task = client.del(key);
-    CHECK_IF_SUCCEEDED(key, "del");
+    auto task = client.rm(key);
+    CHECK_IF_SUCCEEDED(key, "rm");
   }
 
 #undef CHECK_IF_SUCCEEDED
@@ -279,11 +291,9 @@ private:
 public:
   EtcdService() = delete;
 
-  static void RegisterIp(std::string ipAddr) {
-    set(boost::format(etcdIntraDiscoveryFmt) % ipAddr, "");
-  }
+  static void RegisterIntra() { set(FMT(etcdIntraDiscoveryFmt, gNodeIp), ""); }
 
-  static void GetNodeIps() {
+  static void GetAllNodesIp() {
     constexpr int nodeIpQueryInterval = 1;
     etcd::Client client(etcdUrl);
     auto task = client.get("/intra");
@@ -292,13 +302,12 @@ public:
       try {
         etcd::Response response = task.get();
         if (response.is_ok()) {
-          if (response.kvs().size() != gNodeNum) {
+          if (response.keys().size() != gNodeNum) {
             std::this_thread::sleep_for(
                 std::chrono::seconds(nodeIpQueryInterval));
             continue;
           }
-          for (auto &node : response.kvs()) {
-            auto ipAddr = node.key().as_string();
+          for (auto &ipAddr : response.keys()) {
             if (ipAddr == GetIpAddr())
               continue;
             gNodeIps.push_back(ipAddr);
@@ -315,22 +324,22 @@ public:
   }
 
   static void RegisterModelService() {
-    set(boost::format(etcdServiceDiscoveryFmt) % ipAddr, "")
+    set(FMT(etcdServiceDiscoveryFmt, gNodeIp), "")
   }
 
   static void RegisterVersion(std::string modelVersion) {
-    set(boost::format(etcdVersionSyncNodeFmt) % modelVersion % gNodeId, "");
+    set(FMT(etcdVersionSyncNodeFmt, modelVersion % gNodeId), "");
   }
 
   static void UnregisterVersion(std::string modelVersion) {
-    del(boost::format(etcdVersionSyncNodeFmt) % modelVersion % gNodeId);
+    rm(FMT(etcdVersionSyncNodeFmt, modelVersion % gNodeId));
   }
 }; // class EtcdService
 
 class IntraServiceClient final {
 public:
-  IntraServiceClient(std::shared_ptr<Channel> channel)
-      : stub_(InternalModelService::NewStub(channel)) {
+  IntraServiceClient(std::shared_ptr<grpc::Channel> channel)
+      : stub_(IntraService::NewStub(channel)) {
     stop_ = false;
     sendReqThread_ = std::thread(&IntraServiceClient::SendRequest, this);
     parseRespThread_ = std::thread(&IntraServiceClient::ParseResponse, this);
@@ -350,33 +359,33 @@ public:
       std::queue<IntraReq> tempQueue = {};
       {
         std::unique_lock<std::mutex> lock(queueMutex_);
-        condition_.wait(lock, [this] { return !queue_.is_empty(); });
+        condition_.wait(lock, [this] { return !queue_.empty(); });
         std::swap(tempQueue, queue_);
       }
 
       // we can batch many `IntraReq`s to a `BatchedIntraReq`.
       BatchedIntraReq batchedReq;
-      size_t targetMemSize = 0;
       while (!tempQueue.empty()) {
-        batchedReq.add_internal_requests(tempQueue.front());
-        targetMemSize += tempQueue.front().data_len();
+        batchedReq.add_req(tempQueue.front());
         tempQueue.pop();
       }
-      // TODO: I don't think I did it right
-      respDataManager_.AssociateIdAndAddress(batchedReq.id(),
-                                             new uint8_t[targetMemSize]);
-      std::unique_ptr<ClientAsyncResponseReader<BatchedIntraReq>> rpc(
+
+      // TODO: associate addr and id
+
+      std::unique_ptr<grpc::ClientAsyncResponseReader<BatchedIntraReq>> rpc(
           stub_->AsyncGet(&context, batchedReq, &cq_));
       // new a reply, use tag let consumer can get this address, ugly
       // implementation
-      auto reply = new BatchedIntraResp();
+      auto reply = new IntraResp();
+
+      // TODO: `status' is not declared
       rpc->Finished(reply, &status, (void *)reply);
     }
   }
 
   void ParseResponse() {
     IntraResp *batchedResp = nullptr;
-    book ok = false;
+    bool ok = false;
 
     while (!stop_) {
       cq.Next(&batchedResp, &ok);
@@ -392,7 +401,7 @@ public:
         // to, and use it to find location to put data.
         uint8_t *dataStartAddr =
             respDataManager_.GetDataAddress(intraResp.id());
-        for (const auto &intraSliceResp : intraResp.InternalSliceResponse()) {
+        for (const auto &intraSliceResp : intraResp.slice_resp()) {
           uint8_t *dataWriteAddr = dataStartAddr + intraSliceResp.offset();
           auto &sliceData = intraSliceResp.slice_data();
           sliceData.copy(dataWriteAddr, sliceData.length());
@@ -403,12 +412,13 @@ public:
     } // while
   }
 
+  grpc::CompletionQueue cq_; // CompletionQueue is thread safe.
+
 private:
   class IntraRespDataManager {
-  private:
-    unordered_map<int, std::pair<uint8_t *, bool>> dataPointers_;
-
   public:
+    std::unordered_map<int, std::pair<uint8_t *, bool>> dataPointers_;
+
     uint8_t *GetDataAddress(int id) { return dataPointers_[id].first; }
 
     void AssociateIdAndAddress(int id, uint8_t *address) {
@@ -416,17 +426,16 @@ private:
     }
   } respDataManager_; // class IntraRespDataManager
 
-  std::unique_ptr<InternalModelService::stub> stub_;
+  std::unique_ptr<IntraService::stub> stub_;
   std::queue<IntraReq> queue_;
   std::mutex queueMutex_;
   std::condition_variable condition_;
-  CompletionQueue cq_; // CompletionQueue is thread safe.
   bool stop_ = false;
   std::thread sendReqThread_;
   std::thread parseRespThread_;
 }; // class IntraServiceClient
 
-IntraServiceClient *gIntraClients;
+IntraServiceClient **gIntraClients;
 
 void EstablishIntraConn() {
   int ipIter = 0;
@@ -455,67 +464,6 @@ bool LocalRead(uint64_t slice, uint64_t seek, uint64_t len, uint8_t *buffer,
   BOOST_LOG_TRIVIAL(error) << "LocalRead failed";
   return false;
 }
-
-class ModelServiceImpl final : public ModelService::Service {
-private:
-  int getServerIdFor(const SliceRequest &request) {
-    int slice = request.slice_partition();
-    uint64_t avgSlice = gSliceNum / gNodeNum;
-    return slice / avgSlice + 1;
-  }
-
-  // parse requests and send to productor.
-  void
-  convertSliceRequestsToIntraReq(const std::vector<SliceRequest> &sliceRequests,
-                                 vector<uint8_t *> &buffers) {
-    size_t totalOffset = 0;
-    IntraReq intraReqs[gNodeNum];
-    int serverNodeId;
-    uint64_t slice, seek, len;
-
-    for (int i = 0; i < sliceRequests.size(); ++i) {
-      const auto &request = sliceRequests[i];
-      slice = request.slice_partition();
-      seek = request.data_start();
-      len = request.data_len();
-      serverNodeId = getServerIdFor(request);
-      if (serverNodeId == gNodeId) {
-        std::thread(&LocalRead, slice, seek, len, buffers[i],
-                    // TODO: this won't compile cause we don't have the
-                    // declarations here
-                    VersionSystem::GetInstance()->CurrentVersion, false);
-      } else { // this slice data don't belong to this server
-        IntraSliceReq intraSliceReq;
-        intraSliceReq.set_slice_partition(slice);
-        intraSliceReq.set_data_start(seek);
-        intraSliceReq.set_data_len(len);
-        // we need record data offset of slice, because only this we can put
-        // response to proper data.
-        intraSliceReq.set_data_offset(totalOffset);
-        intraReqs[server].add_slice_request(intraSliceReq);
-      }
-
-      totalOffset += len;
-    }
-
-    for (int i = 1; i <= gNodeNum; ++i)
-      if (i != gNodeId)
-        gIntraClients[i]->EnqueueIntraReq(intraReqs[i]);
-  }
-
-public:
-  Status Get(ServerContext *context, const MamaRequest *request,
-             MamaResponse *reply) override {
-    const auto &sliceRequests = request->slices();
-    vector<uint8_t *> buffers(sliceRequests.size());
-    for (int i = 0; i < buffers.size(); i++)
-      buffers[i] = new uint8_t[sliceRequests[i].data_len()];
-    convertSliceRequestsToIntraReq(sliceRequests);
-    // TODO: convert intra response to mama response
-    reply->set_status(0);
-    return Status::OK;
-  }
-}; // class ModelServiceImpl
 
 class IntraServiceImpl final {
 private:
@@ -605,7 +553,7 @@ public:
 
   // There is no shutdown handling in this code.
   void Run(uint16_t port) {
-    std::string server_address = boost::format("0.0.0.0:%1%") % port;
+    std::string server_address = FMT("0.0.0.0:%1%", port);
 
     ServerBuilder builder;
     builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());
@@ -671,7 +619,7 @@ private:
   void watchOtherNodesLoad(std::string modelVersion) {
     etcd::Client client(etcd_url);
     for (int i = 1; i <= gNodeNum; ++i) {
-      std::string key = boost::format(etcdVersionSyncFolderFmt) % modelVersion;
+      std::string key = FMT(etcdVersionSyncFolderFmt, modelVersion);
       auto cb = [this](etcd::Response const &resp) {
         this->watchOtherNodesLoadCb(resp);
       };
@@ -683,7 +631,7 @@ private:
 
   void loadToMem(std::string version) {
     if (gSliceCaches.size() == 2) {
-      EtcdService::UnregisterVersion(gSliceCaches.front().GetVersion());
+      EtcdService::UnregisterVersion(gSliceCaches.front().Version_);
       gSliceCaches.pop_front();
     }
 
@@ -737,7 +685,7 @@ public:
 
       // check if the model.done file exists, if not exists, we need wait
       // until model load to hdfs finished.
-      std::string modelDonePath = boost::format("/%1%/model.done") % filename;
+      std::string modelDonePath = FMT("/%1%/model.done", filename);
       if (hdfsGetPathInfo(fs, modelDonePath.c_str()) == NULL) {
         std::cout << modelDonePath << " doesn't exist" << std::endl;
         continue;
@@ -761,7 +709,7 @@ public:
   int GetVersionSliceCount(std::string modelVersion) {
     int numEntries = 0;
     hdfsFS fs = hdfsConnect("hdfs://namenode", 9000);
-    std::string path = boost::format("/%1%/") % modelVersion;
+    std::string path = FMT("/%1%/", modelVersion);
 
     hdfsFileInfo *fileInfo = hdfsListDirectory(fs, path.c_str(), &numEntries);
     if (unlikely(fileInfo == nullptr || numEntries == 0)) {
@@ -786,15 +734,28 @@ public:
    Only downloads and loads into mem <b>if necessary</b>.
    */
   void DownloadVersionAndLoadIntoMem(std::string modelVersion) {
+    // Harlan: I wanted to do `goto` but they crosses too many variable
+    // initializations; macros suffices now
+#define REGISTER_ETCD()                                                        \
+  EtcdService::RegisterVersion(modelVersion);                                  \
+  watchOtherNodesLoad(modelVersion);
+
+#define LOAD_MEM()                                                             \
+  loadToMem(modelVersion);                                                     \
+  REGISTER_ETCD();
+
     /// 1. check if the version is already loaded in mem
     for (auto &pCache : gSliceCaches) {
-      if (pCache->GetVersion() == modelVersion)
-        goto etcdreg;
+      if (pCache->Version_ == modelVersion) {
+        REGISTER_ETCD();
+        return;
+      }
     }
 
     /// 2. check if the version is already downloaded to local disk
     if (pDownloadInfo_->IsVersionDownloaded(modelVersion)) {
-      goto load;
+      LOAD_MEM();
+      return;
     }
 
     /// 3. the normal slow path
@@ -822,12 +783,10 @@ public:
     downloadCv.wait(downloadLock,
                     [] { pDownloadInfo_->IsVersionDownloaded(modelVersion) });
 
-  load:
-    loadToMem(modelVersion);
+    LOAD_MEM();
 
-  etcdreg:
-    EtcdService::RegisterVersion(modelVersion);
-    watchOtherNodesLoad(modelVersion); // this function is async.
+#undef LOAD_MEM
+#undef REGISTER_ETCD
   }
 
   void Run() {
@@ -850,36 +809,99 @@ public:
   }
 }; // class VersionSystem
 
+// TODO: this kind of gets in the way of our compiling the whole pile
 class Log {
 public:
   // when we enter cltr + c, process show exit elegantly, flush all log to
   // file.
   static void signal_handler(int signum) {
-    if (signum == SIGINT) {
-      BOOST_LOG_TRIVIAL(info) << "Received SIGINT, flushing logs";
-      boost::log::core::get()->flush();
-    }
-    exit(0);
+    // if (signum == SIGINT) {
+    //   BOOST_LOG_TRIVIAL(info) << "Received SIGINT, flushing logs";
+    //   boost::log::core::get()->flush();
+    // }
+    // exit(0);
   }
 
   static void InitLog() {
-    logging::add_file_log(
-        keywords::file_name = "sample_%N.log", /*< file name pattern >*/
-        keywords::rotation_size =
-            10 * 1024 * 1024, /*< rotate files every 10 MiB... >*/
-        keywords::time_based_rotation = sinks::file::rotation_at_time_point(
-            0, 0, 0),                                 /*< ...or at midnight >*/
-        keywords::format = "[%TimeStamp%]: %Message%" /*< log record format >*/
-    );
+    // logging::add_file_log(
+    //     keywords::file_name = "sample_%N.log", /*< file name pattern >*/
+    //     keywords::rotation_size =
+    //         10 * 1024 * 1024, /*< rotate files every 10 MiB... >*/
+    //     keywords::time_based_rotation = sinks::file::rotation_at_time_point(
+    //         0, 0, 0),                                 /*< ...or at midnight
+    //         >*/
+    //     keywords::format = "[%TimeStamp%]: %Message%" /*< log record format
+    //     >*/
+    // );
 
-    logging::core::get()->set_filter(logging::trivial::severity >=
-                                     logging::trivial::info);
+    // logging::core::get()->set_filter(logging::trivial::severity >=
+    //                                  logging::trivial::info);
 
-    logging::add_common_attributes();
+    // logging::add_common_attributes();
 
-    std::signal(SIGINT, signal_handler);
+    // signal(SIGINT, signal_handler);
   }
 }; // class Log
+
+class ModelServiceImpl final : public ModelService::Service {
+private:
+  int getServerIdFor(const SliceRequest &request) {
+    int slice = request.slice_partition();
+    // TODO: we need to maintain the total number of slices in some place
+    uint64_t avgSlice = gSliceNum / gNodeNum;
+    return slice / avgSlice + 1;
+  }
+
+  // parse requests and send to productor.
+  void
+  convertSliceRequestsToIntraReq(const std::vector<SliceRequest> &sliceRequests,
+                                 std::vector<uint8_t *> &buffers) {
+    size_t totalOffset = 0;
+    IntraReq intraReqs[gNodeNum];
+    int serverNodeId;
+    uint64_t slice, seek, len;
+
+    for (int i = 0; i < sliceRequests.size(); ++i) {
+      const auto &request = sliceRequests[i];
+      slice = request.slice_partition();
+      seek = request.data_start();
+      len = request.data_len();
+      serverNodeId = getServerIdFor(request);
+      if (serverNodeId == gNodeId) {
+        std::thread(&LocalRead, slice, seek, len, buffers[i],
+                    VersionSystem::GetInstance()->CurrentVersion, false);
+      } else { // this slice data don't belong to this server
+        IntraSliceReq intraSliceReq;
+        intraSliceReq.set_slice_partition(slice);
+        intraSliceReq.set_data_start(seek);
+        intraSliceReq.set_data_len(len);
+        // we need record data offset of slice, because only this we can put
+        // response to proper data.
+        intraSliceReq.set_offset(totalOffset);
+        intraReqs[serverNodeId].add_slice_request(intraSliceReq);
+      }
+
+      totalOffset += len;
+    }
+
+    for (int i = 1; i <= gNodeNum; ++i)
+      if (i != gNodeId)
+        gIntraClients[i]->EnqueueIntraReq(intraReqs[i]);
+  }
+
+public:
+  Status Get(ServerContext *context, const MamaRequest *request,
+             MamaResponse *reply) override {
+    const auto &sliceRequests = request->slice_request();
+    std::vector<uint8_t *> buffers(sliceRequests.size());
+    for (int i = 0; i < buffers.size(); i++)
+      buffers[i] = new uint8_t[sliceRequests[i].data_len()];
+    convertSliceRequestsToIntraReq(sliceRequests);
+    // TODO: convert intra response to mama response
+    reply->set_status(0);
+    return Status::OK;
+  }
+}; // class ModelServiceImpl
 
 static void RunPublicGrpc() {
   std::string serverAddr("0.0.0.0:50051");
@@ -891,7 +913,7 @@ static void RunPublicGrpc() {
   grpcServerBuilder.AddListeningPort(serverAddr,
                                      grpc::InsecureServerCredentials());
   grpcServerBuilder.RegisterService(&service);
-  std::unique_ptr<grpc::Server> server(builder.BuildAndStart());
+  std::unique_ptr<grpc::Server> server(grpcServerBuilder.BuildAndStart());
   std::cout << "Server listening on " << serverAddr << std::endl;
 
   server->Wait();
@@ -906,19 +928,18 @@ int ParseIntEnv(const char *envName) {
 int main(int argc, char **argv) {
   gNodeId = ParseIntEnv("NODE_ID");
   gNodeNum = ParseIntEnv("NODE_NUM");
+  gNodeIp = GetIpAddr();
   Log::InitLog();
-
-  std::string nodeIp = GetIpAddr();
-  EtcdService::RegisterIp(nodeIp);
-  EtcdService::GetNodeIps(&gNodeIps); // synchronous
-  EstablishIntraConn();
 
   IntraServiceImpl intraServer;
   intraServer.Run(50050); // Don't have to call destructor explicitly
+  EtcdService::RegisterIntra();
+  EtcdService::GetAllNodesIp(); // synchronous
+  EstablishIntraConn();
 
   std::vector<std::thread> threads;
-  thread.emplace_back(&VersionSystem::Versioning, VersionSystem::GetInstance());
-  thread.emplace_back(&RunPublicGrpc);
+  threads.emplace_back(&VersionSystem::Run, VersionSystem::GetInstance());
+  threads.emplace_back(&RunPublicGrpc);
 
   for (auto thread : threads)
     thread.join();
