@@ -229,12 +229,14 @@ public:
 
   void DownloadSliceFromHdfs(std::string version, int slice) {
     std::string command = FMT("mkdir -p ./model_%1%", version);
+    std::cout << "  dispatching command: " << command << std::endl;
     system(command.c_str());
 
     command = FMT("/opt/hadoop-3.3.1/bin/hadoop fs -get "
                   "hdfs://namenode:9000/model_%1%/model_slice.%2$03d "
                   "./model_%1%/model_slice.%2$03d",
                   version % slice);
+    std::cout << "  dispatching command: " << command << std::endl;
     system(command.c_str());
     pLocalDownloadTracker_->RecordDownloadedSlice(version, slice);
   }
@@ -244,9 +246,9 @@ public:
       std::unique_lock<std::mutex> lock(this->queueMutex_);
       this->condition_.wait(
           lock, [this] { return this->stop_ || !this->tasks_.empty(); });
-      if (this->stop_ && this->tasks_.empty()) {
+      std::cout << "  ThreadFunc woken up" << std::endl;
+      if (this->stop_ && this->tasks_.empty())
         return;
-      }
       HdfsModelPath hdfsPath = tasks_.front();
       tasks_.pop();
       lock.unlock();
@@ -264,6 +266,7 @@ public:
   void InsertTask(std::string version, int slice) {
     std::unique_lock<std::mutex> lock(queueMutex_);
     tasks_.emplace(version, slice);
+    this->condition_.notify_one();
   }
 
   // Harlan: I moved it to public since it is accessed in a lambda function,
@@ -764,7 +767,7 @@ public:
   int GetVersionSliceCount(std::string modelVersion) {
     int numEntries = 0;
     hdfsFS fs = hdfsConnect("hdfs://namenode", 9000);
-    std::string path = FMT("/%1%/", modelVersion);
+    std::string path = FMT("/model_%1%/", modelVersion);
 
     hdfsFileInfo *fileInfo = hdfsListDirectory(fs, path.c_str(), &numEntries);
     if (unlikely(fileInfo == nullptr || numEntries == 0)) {
@@ -779,10 +782,9 @@ public:
 
   std::pair<int, int> GetSliceRange(int sliceCount) {
     int avgSlice = sliceCount / gNodeNum;
-    int reminant = sliceCount - avgSlice * gNodeId;
-    int start = (avgSlice + 1) * (gNodeId - 1);
+    int start = avgSlice * (gNodeId - 1);
 
-    return {start, start + std::min(avgSlice, reminant)};
+    return {std::max(0, start - 1), std::min(start + avgSlice + 1, sliceCount)};
   }
 
   /**
@@ -833,14 +835,17 @@ public:
     /// 3. the normal slow path
     std::cout << "[3] downloading version " << version << " from hdfs"
               << std::endl;
-    uint64_t sliceCount = VersionTracker::GetInstance().GetNSlices(version);
+    auto sliceCount = VersionTracker::GetInstance().GetNSlices(version);
     if (!sliceCount) {
       sliceCount = GetVersionSliceCount(version);
       VersionTracker::GetInstance().SetRecord(version, sliceCount);
     }
+    std::cout << "  slice count = " << sliceCount << std::endl;
     auto sliceRange = GetSliceRange(sliceCount);
     auto start = sliceRange.first;
     auto end = sliceRange.second;
+    std::cout << "  planned download: [" << start << ", " << end << "]"
+              << std::endl;
 
     localDownloadTracker_.MarkNewDownload(version, sliceCount, &cvDownload);
     if (pThreadPool_) {
@@ -849,6 +854,7 @@ public:
     }
     pThreadPool_ =
         new DownloadThreadPool(parallelDownloads, &localDownloadTracker_);
+    std::cout << "  download pool created" << std::endl;
     InjectDownloadThreadPool(pThreadPool_);
     for (int i = start; i <= end; ++i)
       pThreadPool_->InsertTask(version, i);
