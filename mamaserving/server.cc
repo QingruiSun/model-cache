@@ -67,16 +67,14 @@ constexpr size_t KB = 1024;
 constexpr size_t MB = 1024 * KB;
 
 constexpr int parallelDownloads = 6;
-constexpr int queryInterval = 1000; // microseconds
+constexpr int queryInterval = 1500; // microseconds
 constexpr int intraPort = 50050;
 
 const std::string etcdUrl = "http://etcd:2379";
-const std::string etcdPublishTaskPrefix = "/tasks/";
-const std::string etcdFinishTaskPrefix = "/finished/";
 const std::string etcdIntraDiscoveryFmt = "/intra/%1%";
 const std::string etcdServiceDiscoveryFmt = "/service/modeling/%1%";
-const std::string etcdVersionSyncFolderFmt = "/version/%1%/";
-const std::string etcdVersionSyncNodeFmt = "/version/%1%/%2%";
+const std::string etcdVersionSyncFolderFmt = "/version-%1%/";
+const std::string etcdVersionSyncNodeFmt = "/version-%1%/%2%";
 
 bool gIsExiting = false;
 int gNodeId;
@@ -89,7 +87,7 @@ std::vector<std::string> gNodeIps;
 class SliceCache {
 private:
   std::string targetPath(int slice) {
-    return FMT("./model_slice.%03d%", slice);
+    return FMT("./model_slice.%1$03d", slice);
   }
 
 public:
@@ -231,7 +229,7 @@ public:
 
   void DownloadSliceFromHdfs(std::string version, int slice) {
     std::string command = FMT("/opt/hadoop-3.3.1/bin/hadoop fs -get "
-                              "/model-%1%/slice-%2% .",
+                              "/model_%1%/model_slice.%2$03d .",
                               version % slice);
     system(command.c_str());
     pLocalDownloadTracker_->RecordDownloadedSlice(version, slice);
@@ -306,16 +304,18 @@ void RegisterIntra() { set(FMT(etcdIntraDiscoveryFmt, gNodeIp), ""); }
 void GetAllNodesIp() {
   constexpr int nodeIpQueryInterval = 1;
   etcd::Client client(etcdUrl);
-  auto task = client.ls("/intra/");
 
   // TODO: add retry logic
   while (true) {
     try {
+      auto task = client.ls("/intra/");
       etcd::Response response = task.get();
       if (response.is_ok()) {
         if (response.keys().size() != gNodeNum) {
           std::this_thread::sleep_for(
               std::chrono::seconds(nodeIpQueryInterval));
+          std::cout << "GetAllNodesIp: only " << response.keys().size()
+                    << " nodes are discovered, retrying..." << std::endl;
           continue;
         }
         for (auto &key : response.keys()) {
@@ -713,7 +713,7 @@ public:
     std::string ret;
     std::vector<std::string> dirs;
 
-    hdfsFileInfo *fileInfo = hdfsListDirectory(fs, "/root/", &numEntries);
+    hdfsFileInfo *fileInfo = hdfsListDirectory(fs, "/", &numEntries);
     if (unlikely(fileInfo == nullptr || numEntries == 0)) {
       ret = "WAIT";
       std::cout << "[WARN] no version found" << std::endl;
@@ -734,17 +734,18 @@ public:
 
         ret = std::string(buffer);
         goto cleanup;
-      }
+      } else if (filename.find("model_") == 0) {
+        // Starting with model_ means it could be valid version.
+        // check if the model.done file exists, if not exists, we need wait
+        // until model load to hdfs finished.
+        std::string modelDonePath = FMT("/%1%/model.done", filename);
+        if (hdfsGetPathInfo(fs, modelDonePath.c_str()) == NULL) {
+          std::cout << modelDonePath << " doesn't exist" << std::endl;
+          continue;
+        }
 
-      // check if the model.done file exists, if not exists, we need wait
-      // until model load to hdfs finished.
-      std::string modelDonePath = FMT("/%1%/model.done", filename);
-      if (hdfsGetPathInfo(fs, modelDonePath.c_str()) == NULL) {
-        std::cout << modelDonePath << " doesn't exist" << std::endl;
-        continue;
+        dirs.push_back(filename.substr(6)); // removing the 'model_' in front
       }
-
-      dirs.push_back(std::move(filename));
     }
 
     sort(dirs.rbegin(), dirs.rend());
@@ -860,6 +861,8 @@ public:
 
     while (!gIsExiting) {
       std::string newVersion = LatestVersionOn(fs);
+      // std::cout << "Current version: " << CurrentVersion
+      //           << ", new version: " << newVersion << std::endl;
       if (newVersion != "WAIT" && CurrentVersion != newVersion) {
         DownloadVersionAndLoadIntoMem(newVersion);
         if (CurrentVersion == "WAIT") {
@@ -868,7 +871,7 @@ public:
         }
         CurrentVersion = std::move(newVersion);
       }
-      std::this_thread::sleep_for(std::chrono::microseconds(queryInterval));
+      std::this_thread::sleep_for(std::chrono::milliseconds(queryInterval));
     }
 
     hdfsDisconnect(fs);
