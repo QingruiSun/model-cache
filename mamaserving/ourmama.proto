@@ -12,7 +12,7 @@ message IntraSliceReq {
 message IntraReq {
     uint64 id = 1;
     string version = 2;
-    repeated IntraSliceReq slice_reqs = 3;
+    repeated IntraSliceReq slice_req = 3;
 }
 
 message BatchedIntraReq {

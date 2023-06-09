@@ -415,15 +415,16 @@ public:
     parseRespThread_ = std::thread(&IntraServiceClient::ParseResponse, this);
   }
 
-  void EnqueueIntraReq(const IntraReq &intraReq) {
+  void EnqueueIntraReq(const IntraReq intraReq) {
     std::unique_lock<std::mutex> lock(queueMutex_);
     queue_.push(intraReq);
     condition_.notify_one();
   }
 
   void SendRequest() {
-    grpc::ClientContext context; // TODO: on stack; wat happens when this goes
-                                 // out of scope?
+    // FIXME: `context` and the `unique_ptr` down below will go out of scope
+    // once this function returns, but the rpc call is still in progress.
+    grpc::ClientContext context;
     grpc::Status status;
 
     while (!stop_) {
@@ -496,9 +497,9 @@ std::vector<IntraServiceClient *> gIntraClients;
 
 void EstablishIntraConn() {
   int ipIter = 0;
-  gIntraClients.resize(gNodeNum + 1);
-  for (int i = 1; i <= gNodeNum; i++) {
-    if (i == gNodeId)
+  gIntraClients.resize(gNodeNum);
+  for (int i = 0; i < gNodeNum; i++) {
+    if (i + 1 == gNodeId)
       gIntraClients[i] = nullptr;
     else
       gIntraClients[i] = new IntraServiceClient(
@@ -542,7 +543,7 @@ private:
 
     void processRequest(const IntraReq &request, IntraResp *reply) {
       uint64_t slice, seek, len;
-      const auto &sliceReqs = request.slice_reqs();
+      const auto &sliceReqs = request.slice_req();
       const auto &version = request.version();
       for (int i = 0; i < sliceReqs.size(); i++) {
         const auto &req = sliceReqs[i];
@@ -626,6 +627,14 @@ public:
       threads_.emplace_back(&IntraServiceImpl::HandleRPCs, this);
   }
 }; // class IntraServiceImpl
+
+std::pair<int, int> GetSliceRange(int sliceCount) {
+  int avgSlice = sliceCount / gNodeNum + (sliceCount % gNodeNum != 0);
+  int start = avgSlice * (gNodeId - 1);
+
+  return {std::max(0, start - 1),
+          std::min(start + avgSlice + 1, sliceCount - 1)};
+}
 
 class VersionSystem {
 private:
@@ -783,13 +792,6 @@ public:
     return numEntries - 2;
   }
 
-  std::pair<int, int> GetSliceRange(int sliceCount) {
-    int avgSlice = sliceCount / gNodeNum;
-    int start = avgSlice * (gNodeId - 1);
-
-    return {std::max(0, start - 1), std::min(start + avgSlice + 1, sliceCount)};
-  }
-
   /**
    Only downloads and loads into mem <b>if necessary</b>. This function is
    synchronous and supposedly takes a few minutes to finish on the slow path.
@@ -942,10 +944,13 @@ public:
 class ModelServiceImpl final : public ModelService::Service {
 private:
   int getServerIdFor(const SliceRequest &request, std::string version) {
+    auto nSlices = VersionSystem::GetInstance()->GetNSlices(version);
+    auto range = GetSliceRange(nSlices);
     int slice = request.slice_partition();
-    uint64_t avgSlice =
-        VersionSystem::GetInstance()->GetNSlices(version) / gNodeNum;
-    return slice / avgSlice + 1;
+    if (range.first <= slice && slice <= range.second)
+      return gNodeId;
+    int avgSlices = nSlices / gNodeNum + (nSlices % gNodeNum != 0);
+    return 1 + slice / avgSlices;
   }
 
   /**
@@ -955,7 +960,7 @@ private:
     int serverNodeId;
     uint64_t slice, seek, len;
     size_t totalOffset = 0;
-    std::vector<IntraReq> intraReqs(gNodeNum);
+    auto *reqsForNode = new IntraReq[gNodeNum];
     std::string targetVersion = VersionSystem::GetInstance()->CurrentVersion;
 
     auto &respman = IntraRespDataManager::GetInstance();
@@ -970,18 +975,28 @@ private:
     totalOffset = 0;
 
     std::vector<std::thread> localReadThreads;
+    auto nSlices = VersionSystem::GetInstance()->GetNSlices(targetVersion);
 
     for (int i = 0; i < sliceRequests.size(); ++i) {
       const auto &request = sliceRequests[i];
       slice = request.slice_partition();
+      if (slice > nSlices) {
+        // TODO: handle this case
+        std::cout << "  requested " << slice << " but only " << nSlices
+                  << " slices available" << std::endl;
+        continue;
+      }
+
       seek = request.data_start();
       len = request.data_len();
       serverNodeId = getServerIdFor(request, targetVersion);
+      std::cout << "  fetching " << slice << " from " << serverNodeId
+                << std::endl;
       if (serverNodeId == gNodeId) {
         localReadThreads.emplace_back(&LocalRead, targetVersion, slice, seek,
                                       len, &buffer, totalOffset);
       } else {
-        auto *pIntraSliceReq = intraReqs[serverNodeId].add_slice_reqs();
+        auto *pIntraSliceReq = reqsForNode[serverNodeId - 1].add_slice_req();
         pIntraSliceReq->set_slice_partition(slice);
         pIntraSliceReq->set_data_start(seek);
         pIntraSliceReq->set_data_len(len);
@@ -993,9 +1008,9 @@ private:
       totalOffset += len;
     }
 
-    for (int i = 1; i <= gNodeNum; ++i) {
-      if (i != gNodeId)
-        gIntraClients[i]->EnqueueIntraReq(intraReqs[i]);
+    for (int i = 0; i < gNodeNum; ++i) {
+      if (i + 1 != gNodeId)
+        gIntraClients[i]->EnqueueIntraReq(reqsForNode[i]);
     }
 
     std::mutex mutResponse;
@@ -1008,6 +1023,8 @@ private:
 
     for (auto &t : localReadThreads)
       t.join();
+
+    delete[] reqsForNode;
 
     // TODO: optimize this by removing buffer copy
     reply->add_slice_data(buffer.data(), buffer.size());
