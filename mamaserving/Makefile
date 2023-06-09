@@ -7,8 +7,9 @@ CXXFLAGS += -std=c++17
 
 CXX = g++
 LDFLAGS += -L/usr/local/lib `pkg-config --libs protobuf grpc++` -pthread -Wl,--no-as-needed -lgrpc++_reflection -Wl,--as-needed -ldl
-LDFLAGS += -lpthread -letcd-cpp-api -lprotobuf -lgrpc++ -lgrpc -lz -lcpprest -lssl -lcrypto -lboost_system -I/usr/local/include/etcd/proto/
-LDFLAGS += -I/usr/local/include/hdfs -L${HADOOP_HOME}/libhdfs -lhdfs 
+LDFLAGS += -lpthread -letcd-cpp-api -lprotobuf -lgrpc++ -lgrpc -lz -lcpprest -lssl -lcrypto
+LDFLAGS += -lboost_system -lboost_filesystem -lmodel_slice_reader
+LDFLAGS += -I/usr/local/include/etcd/proto/ -I/usr/local/include/hdfs -L${HADOOP_HOME}/libhdfs -lhdfs
 
 PROTOC = protoc
 GRPC_CPP_PLUGIN = grpc_cpp_plugin
@@ -18,7 +19,7 @@ PROTOS_PATH = ./
 
 vpath %.proto $(PROTOS_PATH)
 
-mamaserving_server: alimama.pb.o alimama.grpc.pb.o ourmama.pb.o ourmama.grpc.pb.o mamaserving_server.o
+server: alimama.pb.o alimama.grpc.pb.o ourmama.pb.o ourmama.grpc.pb.o server.o
 	$(CXX) $^ $(LDFLAGS) -o $@
 
 .PRECIOUS: %.grpc.pb.cc
@@ -30,4 +31,4 @@ mamaserving_server: alimama.pb.o alimama.grpc.pb.o ourmama.pb.o ourmama.grpc.pb.
 	$(PROTOC) -I $(PROTOS_PATH) --cpp_out=. $<
 
 clean:
-	rm -f *.o *.pb.cc *.pb.h mamaserving_server
+	rm -f *.o *.pb.cc *.pb.h server
