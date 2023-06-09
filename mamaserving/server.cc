@@ -407,6 +407,14 @@ public:
 }; // class IntraRespDataManager
 
 class IntraServiceClient final {
+private:
+  struct AsyncClientCall {
+    grpc::ClientContext context;
+    std::unique_ptr<grpc::ClientAsyncResponseReader<IntraResp>> responseReader;
+    IntraResp reply;
+    grpc::Status status;
+  };
+
 public:
   IntraServiceClient(std::shared_ptr<grpc::Channel> channel)
       : stub_(IntraService::NewStub(channel)) {
@@ -424,9 +432,6 @@ public:
   void SendRequest() {
     // FIXME: `context` and the `unique_ptr` down below will go out of scope
     // once this function returns, but the rpc call is still in progress.
-    grpc::ClientContext context;
-    grpc::Status status;
-
     while (!stop_) {
       std::queue<IntraReq> tempQueue = {};
       {
@@ -443,41 +448,37 @@ public:
         tempQueue.pop();
       }
 
-      std::unique_ptr<grpc::ClientAsyncResponseReader<IntraResp>> rpc(
-          stub_->AsyncGet(&context, batchedReq, &cq_));
-      // new a reply, use tag let consumer can get this address, ugly
-      // implementation
-      auto reply = new IntraResp();
-      rpc->Finish(reply, &status, (void *)reply);
+      AsyncClientCall *call = new AsyncClientCall;
+      call->responseReader = stub_->AsyncGet(&call->context, batchedReq, &cq_);
+      call->responseReader->Finish(&call->reply, &call->status, (void *)call);
     }
   }
 
   void ParseResponse() {
-    IntraResp *intraResp = nullptr;
     void *tag;
     bool ok = false;
     IntraRespDataManager &respman = IntraRespDataManager::GetInstance();
 
     while (!stop_) {
       cq_.Next(&tag, &ok);
-      intraResp = reinterpret_cast<IntraResp *>(tag);
-      if (unlikely(!ok || !intraResp)) {
+      if (unlikely(!ok)) {
         // BOOST_LOG_TRIVIAL(error) << "failed to get response from server";
         continue;
       }
+      AsyncClientCall *call = static_cast<AsyncClientCall *>(tag);
+      auto &intraResp = call->reply;
 
-      RawBuffer *pBuffer = respman.GetBufferPtr(intraResp->id());
-      const auto &intraSliceResps = intraResp->slice_resp();
+      RawBuffer *pBuffer = respman.GetBufferPtr(intraResp.id());
+      const auto &intraSliceResps = intraResp.slice_resp();
       for (auto &sliceResp : intraSliceResps) {
         const auto *copyFrom =
             reinterpret_cast<const uint8_t *>(sliceResp.data().data());
         auto copyTo = pBuffer->begin() + sliceResp.offset();
         std::copy(copyFrom, copyFrom + sliceResp.data().size(), copyTo);
       }
-      respman.ReportFinishedResponseFor(intraResp->id());
+      respman.ReportFinishedResponseFor(intraResp.id());
 
-      delete intraResp;
-      intraResp = nullptr;
+      delete call;
     }
   }
 
@@ -990,8 +991,8 @@ private:
       seek = request.data_start();
       len = request.data_len();
       serverNodeId = getServerIdFor(request, targetVersion);
-      std::cout << "  fetching " << slice << " from " << serverNodeId
-                << std::endl;
+      // std::cout << "  fetching " << slice << " from " << serverNodeId
+      //           << std::endl;
       if (serverNodeId == gNodeId) {
         localReadThreads.emplace_back(&LocalRead, targetVersion, slice, seek,
                                       len, &buffer, totalOffset);
