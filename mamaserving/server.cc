@@ -73,7 +73,7 @@ constexpr int intraPort = 50050;
 const std::string etcdUrl = "http://etcd:2379";
 const std::string etcdIntraDiscoveryFmt = "/intra/%1%";
 const std::string etcdServiceDiscoveryFmt = "/service/modeling/%1%";
-const std::string etcdVersionSyncFolderFmt = "/version-%1%/";
+const std::string etcdVersionSyncPrefixFmt = "/version-%1%/";
 const std::string etcdVersionSyncNodeFmt = "/version-%1%/%2%";
 
 bool gIsExiting = false;
@@ -228,9 +228,13 @@ public:
   }
 
   void DownloadSliceFromHdfs(std::string version, int slice) {
-    std::string command = FMT("/opt/hadoop-3.3.1/bin/hadoop fs -get "
-                              "/model_%1%/model_slice.%2$03d .",
-                              version % slice);
+    std::string command = FMT("mkdir -p ./model_%1%", version);
+    system(command.c_str());
+
+    command = FMT("/opt/hadoop-3.3.1/bin/hadoop fs -get "
+                  "hdfs://namenode:9000/model_%1%/model_slice.%2$03d "
+                  "./model_%1%/model_slice.%2$03d",
+                  version % slice);
     system(command.c_str());
     pLocalDownloadTracker_->RecordDownloadedSlice(version, slice);
   }
@@ -622,7 +626,7 @@ class VersionSystem {
 private:
   LocalDownloadTracker localDownloadTracker_;
   DownloadThreadPool *pThreadPool_;
-  etcd::Watcher *pLoadWatcher = nullptr;
+  etcd::Watcher *pLoadWatcher_ = nullptr;
 
   class VersionTracker {
     std::unordered_map<std::string, size_t> record_;
@@ -641,22 +645,18 @@ private:
     }
   }; // class VersionTracker
 
-  void watchOtherNodesLoadCb(etcd::Response const &resp,
+  void watchOtherNodesLoadCb(etcd::Response const &_resp, std::string &version,
                              std::atomic<bool> &isDlFinished,
                              std::condition_variable &cv) {
-    if (resp.error_code()) {
-      // BOOST_LOG_TRIVIAL(error)
-      //     << "node " << gNodeId << " recieve version load info failed "
-      //     << resp.error_code();
-    } else {
-      if (resp.action() == "set") {
-        if (resp.keys().size() == gNodeNum) {
-          isDlFinished.store(true);
-          cv.notify_one();
-        }
-      } else {
-        // don't do anything, as `del' is legal here
-      }
+    etcd::Client client(etcdUrl);
+    auto task = client.ls(FMT(etcdVersionSyncPrefixFmt, version));
+    auto response = task.get();
+    if (response.keys().size() == gNodeNum) {
+      isDlFinished.store(true);
+      cv.notify_one();
+
+      this->pLoadWatcher_->Cancel();
+      delete this->pLoadWatcher_;
     }
   }
 
@@ -669,12 +669,12 @@ private:
                                 std::condition_variable &cv) {
     etcd::Client client(etcdUrl);
     for (int i = 1; i <= gNodeNum; ++i) {
-      std::string key = FMT(etcdVersionSyncFolderFmt, version);
+      std::string key = FMT(etcdVersionSyncPrefixFmt, version);
       auto cb = [&, this](etcd::Response const &resp) {
-        this->watchOtherNodesLoadCb(resp, isDlFinished, cv);
+        this->watchOtherNodesLoadCb(resp, version, isDlFinished, cv);
       };
 
-      pLoadWatcher = new etcd::Watcher(client, key, cb, true);
+      pLoadWatcher_ = new etcd::Watcher(client, key, cb, true);
     }
   }
 
@@ -791,13 +791,15 @@ public:
    */
   void DownloadVersionAndLoadIntoMem(std::string version) {
     std::mutex mutDownload;
-    std::unique_lock lkDownload(mutDownload);
+    std::unique_lock<std::mutex> lkDownload(mutDownload);
     std::condition_variable cvDownload;
 
     std::atomic<bool> isDlFinished(false);
     std::mutex mutOthersReady;
-    std::unique_lock lkOthersReady(mutOthersReady);
+    std::unique_lock<std::mutex> lkOthersReady(mutOthersReady);
     std::condition_variable cvOthersReady;
+
+    std::cout << "locks ready" << std::endl;
 
     // Harlan: I wanted to do `goto` but they crosses too many variable
     // initializations; macros suffices now
@@ -811,6 +813,8 @@ public:
   REGISTER_ETCD();
 
     /// 1. check if the version is already loaded in mem
+    std::cout << "[1] checking if version " << version << " is in ram"
+              << std::endl;
     for (auto &pCache : gSliceCaches) {
       if (pCache->Version_ == version) {
         REGISTER_ETCD();
@@ -819,12 +823,16 @@ public:
     }
 
     /// 2. check if the version is already downloaded to local disk
+    std::cout << "[2] checking if version " << version << " is in disk"
+              << std::endl;
     if (localDownloadTracker_.IsVersionDownloaded(version)) {
       LOAD_MEM();
       return;
     }
 
     /// 3. the normal slow path
+    std::cout << "[3] downloading version " << version << " from hdfs"
+              << std::endl;
     uint64_t sliceCount = VersionTracker::GetInstance().GetNSlices(version);
     if (!sliceCount) {
       sliceCount = GetVersionSliceCount(version);
@@ -861,9 +869,10 @@ public:
 
     while (!gIsExiting) {
       std::string newVersion = LatestVersionOn(fs);
-      // std::cout << "Current version: " << CurrentVersion
-      //           << ", new version: " << newVersion << std::endl;
+      std::cout << "Current version: " << CurrentVersion
+                << ", new version: " << newVersion << std::endl;
       if (newVersion != "WAIT" && CurrentVersion != newVersion) {
+        std::cout << "Getting version " << newVersion << std::endl;
         DownloadVersionAndLoadIntoMem(newVersion);
         if (CurrentVersion == "WAIT") {
           // We're required to register this service onto Etcd
