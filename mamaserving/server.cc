@@ -430,8 +430,6 @@ public:
   }
 
   void SendRequest() {
-    // FIXME: `context` and the `unique_ptr` down below will go out of scope
-    // once this function returns, but the rpc call is still in progress.
     while (!stop_) {
       std::queue<IntraReq> tempQueue = {};
       {
