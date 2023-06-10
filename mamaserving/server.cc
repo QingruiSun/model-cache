@@ -959,7 +959,7 @@ private:
    Synchronous function. It will block until the data is ready.
    */
   void progress(const MamaRequest *request, MamaResponse *reply) {
-    std::cout << "progress()" << std::endl;
+    // std::cout << "progress()" << std::endl;
 
     int serverNodeId;
     uint64_t slice, seek, len;
@@ -976,7 +976,7 @@ private:
       totalOffset += sr.data_len();
 
     std::vector<uint8_t> buffer(totalOffset, 0);
-    std::cout << "  allocated buffer of size " << totalOffset << std::endl;
+    // std::cout << "  allocated buffer of size " << totalOffset << std::endl;
     respman.AssociateIdAndBuffer(respmanId, &buffer);
     totalOffset = 0;
 
@@ -1031,12 +1031,12 @@ private:
       respman.AssociateIdAndCv(respmanId, &cvResponse);
       cvResponse.wait(lkResponse,
                       [&] { return respman.IsBatchFinished(respmanId); });
-      std::cout << "  intra read finished" << std::endl;
+      // std::cout << "  intra read finished" << std::endl;
     }
 
     for (auto &t : localReadThreads)
       t.join();
-    std::cout << "  local read finished" << std::endl;
+    // std::cout << "  local read finished" << std::endl;
 
     delete[] reqsForNode;
 
