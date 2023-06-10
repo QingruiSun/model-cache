@@ -6,17 +6,6 @@
 #include <arpa/inet.h>
 #include <boost/filesystem.hpp>
 #include <boost/format.hpp>
-// #include <boost/log/core.hpp>
-// #include <boost/log/expressions.hpp>
-// #include <boost/log/sinks/text_file_backend.hpp>
-// #include <boost/log/sources/record_ostream.hpp>
-// #include <boost/log/sources/severity_logger.hpp>
-// #include <boost/log/trivial.hpp>
-// #include <boost/log/utility/setup/common_attributes.hpp>
-// #include <boost/log/utility/setup/file.hpp>
-#include <boost/uuid/uuid.hpp>
-#include <boost/uuid/uuid_generators.hpp>
-#include <boost/uuid/uuid_io.hpp>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
@@ -31,6 +20,7 @@
 #include <ifaddrs.h>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <netinet/in.h>
 #include <queue>
 #include <shared_mutex>
@@ -84,6 +74,10 @@ std::string gNodeIp;
 std::vector<std::string> gNodeIps;
 
 #define FMT(fmt, ...) boost::str(boost::format(fmt) % __VA_ARGS__)
+
+void SleepMilli(int ms) {
+  std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+}
 
 class SliceCache;
 std::deque<SliceCache *> gSliceCaches;
@@ -161,7 +155,7 @@ class LocalDownloadTracker {
 public:
   void RecordDownloadedSlice(std::string version, int slice) {
     std::cout << "  > " << version << "[" << slice << "] finished" << std::endl;
-    std::unique_lock<std::mutex> lock(mutex_);
+    std::unique_lock lock(mutex_);
 
     auto &versionRecord = ivr_[version];
     versionRecord.finishedSlices.insert(slice);
@@ -173,19 +167,20 @@ public:
   }
 
   bool IsSliceDownloaded(std::string version, int slice) {
-    std::unique_lock<std::mutex> lock(mutex_);
+    std::shared_lock lock(mutex_);
+
     auto &fins = ivr_[version].finishedSlices;
     return fins.count(slice) > 0;
   }
 
   bool IsVersionDownloaded(std::string version) {
-    std::unique_lock<std::mutex> lock(mutex_);
+    std::shared_lock lock(mutex_);
     return finishedVersions_.count(version) > 0;
   }
 
   void MarkNewDownload(std::string version, int requiredSlices,
                        std::condition_variable *cv) {
-    std::unique_lock<std::mutex> lock(mutex_);
+    std::unique_lock lock(mutex_);
     ivr_[version].requiredSlices = requiredSlices;
     versionCv_[version] = cv;
   }
@@ -198,7 +193,7 @@ private:
     bool finished() { return requiredSlices == finishedSlices.size(); }
   };
 
-  std::mutex mutex_;
+  std::shared_mutex mutex_;
   std::unordered_map<std::string, InternalVersionRecord> ivr_;
   std::unordered_set<std::string> finishedVersions_;
   std::unordered_map<std::string, std::condition_variable *> versionCv_;
@@ -315,26 +310,22 @@ void RegisterIntra() {
 }
 
 void GetAllNodesIp() {
-  constexpr int nodeIpQueryInterval = 1;
   etcd::Client client(etcdUrl);
   gNodeIps.resize(gNodeNum);
 
-  // TODO: add retry logic
   while (true) {
     try {
-      auto task = client.ls("/intra/");
-      auto response = task.get();
+      auto response = client.ls("/intra/").get();
       if (response.is_ok()) {
         if (response.keys().size() != gNodeNum) {
-          std::this_thread::sleep_for(
-              std::chrono::seconds(nodeIpQueryInterval));
           std::cout << "GetAllNodesIp: only " << response.keys().size()
                     << " nodes are discovered, retrying..." << std::endl;
+          SleepMilli(queryInterval);
           continue;
         }
         for (auto &key : response.keys()) {
           auto ipAddr = key.substr(key.find_last_of('/') + 1);
-          std::cout << "discovered ip: " << ipAddr << std::endl;
+          // TODO: add error handling
           auto nodeId = std::stoi(client.get(key).get().value().as_string());
           gNodeIps[nodeId - 1] = std::move(ipAddr);
         }
@@ -343,12 +334,11 @@ void GetAllNodesIp() {
       } else {
         std::cout << "GetAllNodesIp failed: " << response.error_code() << " "
                   << response.error_message() << std::endl;
-        return;
+        SleepMilli(queryInterval);
       }
     } catch (const std::exception &e) {
       std::cout << "An exception occurred during GetAllNodesIp: " << e.what()
                 << std::endl;
-
       return;
     }
   }
@@ -371,11 +361,12 @@ class IntraRespDataManager {
 private:
   static constexpr size_t MAX_RING_SIZE = 0x5600;
 
+  std::atomic<size_t> id_ = 0;
+
   IntraRespDataManager() = default;
   IntraRespDataManager(const IntraRespDataManager &) = delete;
   IntraRespDataManager &operator=(const IntraRespDataManager &) = delete;
 
-  std::atomic<size_t> id_ = 0;
   struct Record {
     RawBuffer buffer;
     std::condition_variable cv;
@@ -701,10 +692,9 @@ private:
       if (response.keys().size() == gNodeNum) {
         pIsDlFinished->store(true);
         pCv->notify_one();
-
         return;
       }
-      std::this_thread::sleep_for(std::chrono::milliseconds(queryInterval));
+      SleepMilli(queryInterval);
     }
   }
 
@@ -934,42 +924,6 @@ public:
   }
 }; // class VersionSystem
 
-// TODO: this kind of gets in the way of our compiling the whole pile
-class Log {
-public:
-  // when we enter cltr + c, process show exit elegantly, flush all log to
-  // file.
-  static void signal_handler(int signum) {
-    // if (signum == SIGINT) {
-    //   BOOST_LOG_TRIVIAL(info) << "Received SIGINT, flushing logs";
-    //   boost::log::core::get()->flush();
-    // }
-    // exit(0);
-  }
-
-  static void InitLog() {
-    // logging::add_file_log(
-    //     keywords::file_name = "sample_%N.log", /*< file name pattern >*/
-    //     keywords::rotation_size =
-    //         10 * 1024 * 1024, /*< rotate files every 10 MiB... >*/
-    //     keywords::time_based_rotation =
-    //         sinks::file::rotation_at_time_point(0, 0, 0), /*< ...or at
-    //         midnight
-    //             >*/
-    //     keywords::format = "[%TimeStamp%]: %Message%"     /*< log record
-    //     format
-    //         >*/
-    // );
-
-    // logging::core::get()->set_filter(logging::trivial::severity >=
-    //                                  logging::trivial::info);
-
-    // logging::add_common_attributes();
-
-    // signal(SIGINT, signal_handler);
-  }
-}; // class Log
-
 class ModelServiceImpl final : public ModelService::Service {
 private:
   int getServerIdFor(const SliceRequest &request, std::string version) {
@@ -986,8 +940,6 @@ private:
    Synchronous function. It will block until the data is ready.
    */
   void progress(const MamaRequest *request, MamaResponse *reply) {
-    // std::cout << "progress()" << std::endl;
-
     int serverNodeId;
     uint64_t slice, seek, len;
     size_t totalOffset = 0;
@@ -1111,10 +1063,9 @@ int main(int argc, char **argv) {
   gNodeId = ParseIntEnv("NODE_ID") - 1;
   gNodeNum = ParseIntEnv("NODE_NUM");
   gNodeIp = GetIpAddr();
-  Log::InitLog();
 
   IntraServiceImpl intraServer;
-  intraServer.Run(intraPort); // Don't have to call destructor explicitly
+  intraServer.Run(intraPort); // Don't have to call the destructor explicitly
   EtcdService::RegisterIntra();
   EtcdService::GetAllNodesIp(); // synchronous
   EstablishIntraConn();
