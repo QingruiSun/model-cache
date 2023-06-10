@@ -84,6 +84,8 @@ std::vector<std::string> gNodeIps;
 
 #define FMT(fmt, ...) boost::str(boost::format(fmt) % __VA_ARGS__)
 
+class SliceCache;
+std::deque<SliceCache *> gSliceCaches;
 class SliceCache {
 private:
   std::string targetPath(int slice) {
@@ -102,9 +104,11 @@ public:
   void Load() {
     readers_.resize(cnt_);
     for (int i = 0; i < cnt_; i++) {
+      // TODO: what if a version switch happens during load
       readers_[i] = new ModelSliceReader();
       readers_[i]->Load(targetPath(start_ + i));
     }
+    gSliceCaches.push_back(this);
   }
 
   bool Has(int slice) { return slice >= start_ && slice < start_ + cnt_; }
@@ -122,9 +126,7 @@ public:
     char *targetMem = reinterpret_cast<char *>(rawArray + bufferOffset);
     readers_[slice - start_]->Read(seek, len, targetMem);
   }
-};
-
-std::deque<SliceCache *> gSliceCaches;
+}; // class SliceCache
 
 std::string GetIpAddr() {
   struct ifaddrs *addresses;
@@ -395,7 +397,7 @@ public:
   }
 
   bool IsBatchFinished(size_t id) {
-    return pRespCnt_[id % MAX_RING_SIZE] == gNodeNum;
+    return pRespCnt_[id % MAX_RING_SIZE] == gNodeNum - 1;
   }
 
   void ReportFinishedResponseFor(size_t id) {
@@ -446,7 +448,7 @@ public:
         tempQueue.pop();
       }
 
-      AsyncClientCall *call = new AsyncClientCall;
+      AsyncClientCall *call = new AsyncClientCall();
       call->responseReader = stub_->AsyncGet(&call->context, batchedReq, &cq_);
       call->responseReader->Finish(&call->reply, &call->status, (void *)call);
     }
@@ -544,6 +546,8 @@ private:
       uint64_t slice, seek, len;
       const auto &sliceReqs = request.slice_req();
       const auto &version = request.version();
+      reply->set_id(request.id());
+
       for (int i = 0; i < sliceReqs.size(); i++) {
         const auto &req = sliceReqs[i];
         slice = req.slice_partition();
@@ -690,7 +694,7 @@ private:
   }
 
   void loadToMem(std::string version, int start, int cnt) {
-    if (gSliceCaches.size() == 2) {
+    if (gSliceCaches.size() > 2) {
       std::cout << "  popping out old cache" << std::endl;
 
       auto *pOldCache = gSliceCaches.front();
@@ -702,8 +706,7 @@ private:
     }
 
     std::cout << "  Preparing new cache" << std::endl;
-    gSliceCaches.push_back(new SliceCache(version, start, cnt));
-    gSliceCaches.back()->Load();
+    (new SliceCache(version, start, cnt))->Load();
   }
 
   VersionSystem() = default;
@@ -881,9 +884,9 @@ public:
 
     while (!gIsExiting) {
       std::string newVersion = LatestVersionOn(fs);
-      std::cout << "Current version: " << CurrentVersion
-                << ", new version: " << newVersion << std::endl;
       if (newVersion != "WAIT" && CurrentVersion != newVersion) {
+        std::cout << "Current version: " << CurrentVersion
+                  << ", new version: " << newVersion << std::endl;
         std::cout << "Getting version " << newVersion << std::endl;
         DownloadVersionAndLoadIntoMem(newVersion);
         if (CurrentVersion == "WAIT") {
@@ -956,11 +959,14 @@ private:
    Synchronous function. It will block until the data is ready.
    */
   void progress(const MamaRequest *request, MamaResponse *reply) {
+    std::cout << "progress()" << std::endl;
+
     int serverNodeId;
     uint64_t slice, seek, len;
     size_t totalOffset = 0;
     auto *reqsForNode = new IntraReq[gNodeNum];
     std::string targetVersion = VersionSystem::GetInstance()->CurrentVersion;
+    bool isLocal = true;
 
     auto &respman = IntraRespDataManager::GetInstance();
     auto respmanId = respman.GetId();
@@ -970,6 +976,7 @@ private:
       totalOffset += sr.data_len();
 
     std::vector<uint8_t> buffer(totalOffset, 0);
+    std::cout << "  allocated buffer of size " << totalOffset << std::endl;
     respman.AssociateIdAndBuffer(respmanId, &buffer);
     totalOffset = 0;
 
@@ -995,6 +1002,8 @@ private:
         localReadThreads.emplace_back(&LocalRead, targetVersion, slice, seek,
                                       len, &buffer, totalOffset);
       } else {
+        isLocal = false;
+
         auto *pIntraSliceReq = reqsForNode[serverNodeId - 1].add_slice_req();
         pIntraSliceReq->set_slice_partition(slice);
         pIntraSliceReq->set_data_start(seek);
@@ -1007,21 +1016,27 @@ private:
       totalOffset += len;
     }
 
-    for (int i = 0; i < gNodeNum; ++i) {
-      if (i + 1 != gNodeId)
-        gIntraClients[i]->EnqueueIntraReq(reqsForNode[i]);
-    }
-
     std::mutex mutResponse;
     std::unique_lock<std::mutex> lkResponse(mutResponse);
     std::condition_variable cvResponse;
 
-    respman.AssociateIdAndCv(respmanId, &cvResponse);
-    cvResponse.wait(lkResponse,
-                    [&] { return respman.IsBatchFinished(respmanId); });
+    if (!isLocal) {
+      for (int i = 0; i < gNodeNum; ++i) {
+        if (i + 1 != gNodeId) {
+          reqsForNode[i].set_id(respmanId);
+          gIntraClients[i]->EnqueueIntraReq(reqsForNode[i]);
+        }
+      }
+
+      respman.AssociateIdAndCv(respmanId, &cvResponse);
+      cvResponse.wait(lkResponse,
+                      [&] { return respman.IsBatchFinished(respmanId); });
+      std::cout << "  intra read finished" << std::endl;
+    }
 
     for (auto &t : localReadThreads)
       t.join();
+    std::cout << "  local read finished" << std::endl;
 
     delete[] reqsForNode;
 
