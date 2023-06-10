@@ -33,6 +33,7 @@
 #include <memory>
 #include <netinet/in.h>
 #include <queue>
+#include <shared_mutex>
 #include <string>
 #include <sys/socket.h>
 #include <thread>
@@ -58,7 +59,7 @@ using ourmama::proto::IntraService;
 using grpc::ServerContext;
 using grpc::Status;
 
-using RawBuffer = std::vector<uint8_t>;
+using RawBuffer = char *;
 
 #define likely(x) __builtin_expect(!!(x), 1)
 #define unlikely(x) __builtin_expect(!!(x), 0)
@@ -120,10 +121,9 @@ public:
     }
   }
 
-  void Read(int slice, size_t seek, size_t len, RawBuffer *pBuffer,
+  void Read(int slice, size_t seek, size_t len, RawBuffer buffer,
             size_t bufferOffset) {
-    uint8_t *rawArray = pBuffer->data(); // !! very dangerous, but fast
-    char *targetMem = reinterpret_cast<char *>(rawArray + bufferOffset);
+    char *targetMem = buffer + bufferOffset;
     readers_[slice - start_]->Read(seek, len, targetMem);
   }
 }; // class SliceCache
@@ -310,17 +310,20 @@ void rm(std::string key) {
 
 #undef LAUNCH_ETCD_TASK
 
-void RegisterIntra() { set(FMT(etcdIntraDiscoveryFmt, gNodeIp), ""); }
+void RegisterIntra() {
+  set(FMT(etcdIntraDiscoveryFmt, gNodeIp), std::getenv("NODE_ID"));
+}
 
 void GetAllNodesIp() {
   constexpr int nodeIpQueryInterval = 1;
   etcd::Client client(etcdUrl);
+  gNodeIps.resize(gNodeNum);
 
   // TODO: add retry logic
   while (true) {
     try {
       auto task = client.ls("/intra/");
-      etcd::Response response = task.get();
+      auto response = task.get();
       if (response.is_ok()) {
         if (response.keys().size() != gNodeNum) {
           std::this_thread::sleep_for(
@@ -332,9 +335,8 @@ void GetAllNodesIp() {
         for (auto &key : response.keys()) {
           auto ipAddr = key.substr(key.find_last_of('/') + 1);
           std::cout << "discovered ip: " << ipAddr << std::endl;
-          if (ipAddr == gNodeIp)
-            continue;
-          gNodeIps.push_back(std::move(ipAddr));
+          auto nodeId = std::stoi(client.get(key).get().value().as_string());
+          gNodeIps[nodeId - 1] = std::move(ipAddr);
         }
         return;
 
@@ -367,16 +369,19 @@ static void UnregisterVersion(std::string modelVersion) {
 
 class IntraRespDataManager {
 private:
-  static constexpr size_t MAX_RING_SIZE = 0x2800;
+  static constexpr size_t MAX_RING_SIZE = 0x5600;
 
   IntraRespDataManager() = default;
   IntraRespDataManager(const IntraRespDataManager &) = delete;
   IntraRespDataManager &operator=(const IntraRespDataManager &) = delete;
 
   std::atomic<size_t> id_ = 0;
-  RawBuffer *(pBuffers_[MAX_RING_SIZE]);
-  std::condition_variable *(pCv_[MAX_RING_SIZE]);
-  std::atomic<size_t> pRespCnt_[MAX_RING_SIZE];
+  struct Record {
+    RawBuffer buffer;
+    std::condition_variable cv;
+    std::atomic<uint8_t> remains;
+    std::shared_mutex mutex;
+  } records_[MAX_RING_SIZE];
 
 public:
   static IntraRespDataManager &GetInstance() {
@@ -386,25 +391,44 @@ public:
 
   size_t GetId() { return id_++; }
 
-  RawBuffer *GetBufferPtr(size_t id) { return pBuffers_[id % MAX_RING_SIZE]; }
+  RawBuffer GetBuffer(size_t id) { return records_[id % MAX_RING_SIZE].buffer; }
 
-  void AssociateIdAndBuffer(size_t id, RawBuffer *pbuff) {
-    pBuffers_[id % MAX_RING_SIZE] = pbuff;
-  }
+  std::pair<int, std::condition_variable *> Register(RawBuffer buff,
+                                                     uint8_t remains) {
+    int id = id_++;
+    int ringId = id % MAX_RING_SIZE;
+    auto &record = records_[ringId];
+    record.mutex.lock();
 
-  void AssociateIdAndCv(size_t id, std::condition_variable *pCv) {
-    pCv_[id % MAX_RING_SIZE] = pCv;
+    record.buffer = buff;
+    record.remains = remains;
+
+    record.mutex.unlock();
+    return {id, &record.cv};
   }
 
   bool IsBatchFinished(size_t id) {
-    return pRespCnt_[id % MAX_RING_SIZE] == gNodeNum - 1;
+    int ringId = id % MAX_RING_SIZE;
+    auto &record = records_[ringId];
+    record.mutex.lock_shared();
+
+    bool ret = record.remains == 0;
+
+    record.mutex.unlock_shared();
+    return ret;
   }
 
   void ReportFinishedResponseFor(size_t id) {
-    auto ringId = id % MAX_RING_SIZE;
-    ++pRespCnt_[ringId];
-    if (IsBatchFinished(id))
-      pCv_[ringId]->notify_one();
+    int ringId = id % MAX_RING_SIZE;
+    auto &record = records_[ringId];
+    record.mutex.lock();
+
+    bool finished = (--record.remains) == 0;
+
+    record.mutex.unlock();
+
+    if (finished)
+      record.cv.notify_one();
   }
 }; // class IntraRespDataManager
 
@@ -468,12 +492,11 @@ public:
       AsyncClientCall *call = static_cast<AsyncClientCall *>(tag);
       auto &intraResp = call->reply;
 
-      RawBuffer *pBuffer = respman.GetBufferPtr(intraResp.id());
+      RawBuffer buffer = respman.GetBuffer(intraResp.id());
       const auto &intraSliceResps = intraResp.slice_resp();
       for (auto &sliceResp : intraSliceResps) {
-        const auto *copyFrom =
-            reinterpret_cast<const uint8_t *>(sliceResp.data().data());
-        auto copyTo = pBuffer->begin() + sliceResp.offset();
+        const char *copyFrom = sliceResp.data().data();
+        char *copyTo = buffer + sliceResp.offset();
         std::copy(copyFrom, copyFrom + sliceResp.data().size(), copyTo);
       }
       respman.ReportFinishedResponseFor(intraResp.id());
@@ -497,14 +520,13 @@ private:
 std::vector<IntraServiceClient *> gIntraClients;
 
 void EstablishIntraConn() {
-  int ipIter = 0;
   gIntraClients.resize(gNodeNum);
   for (int i = 0; i < gNodeNum; i++) {
-    if (i + 1 == gNodeId)
+    if (i == gNodeId)
       gIntraClients[i] = nullptr;
     else
       gIntraClients[i] = new IntraServiceClient(
-          grpc::CreateChannel(FMT("%1%:%2%", gNodeIps[ipIter++] % intraPort),
+          grpc::CreateChannel(FMT("%1%:%2%", gNodeIps[i] % intraPort),
                               grpc::InsecureChannelCredentials()));
   }
 }
@@ -513,15 +535,15 @@ void EstablishIntraConn() {
  @returns `true` if succeeds, `false` otherwise.
  */
 bool LocalRead(const std::string &version, uint64_t slice, uint64_t seek,
-               uint64_t len, RawBuffer *pBuffer, size_t bufferOffset) {
+               uint64_t len, RawBuffer buffer, size_t bufferOffset) {
   for (auto pCache : gSliceCaches) {
     if (pCache->Version_ == version && pCache->Has(slice)) {
-      pCache->Read(slice, seek, len, pBuffer, bufferOffset);
+      pCache->Read(slice, seek, len, buffer, bufferOffset);
       return true;
     }
   }
 
-  // BOOST_LOG_TRIVIAL(error) << "LocalRead failed";
+  std::cout << "LocalRead failed to find slice in cache" << std::endl;
   return false;
 }
 
@@ -548,25 +570,30 @@ private:
       const auto &version = request.version();
       reply->set_id(request.id());
 
-      for (int i = 0; i < sliceReqs.size(); i++) {
-        const auto &req = sliceReqs[i];
+      size_t bufferSize = 0;
+      for (const auto &req : sliceReqs)
+        bufferSize = std::max(bufferSize, req.data_len());
+      RawBuffer buffer = new char[bufferSize];
+
+      for (const auto &req : sliceReqs) {
         slice = req.slice_partition();
         seek = req.data_start();
         len = req.data_len();
 
-        RawBuffer buffer(len);
-        if (!LocalRead(version, slice, seek, len, &buffer, 0)) {
-          // BOOST_LOG_TRIVIAL(error) << "LocalRead failed";
+        if (!LocalRead(version, slice, seek, len, buffer, 0)) {
+          std::cout << "LocalRead failed for " << version << " " << slice << " "
+                    << seek << " " << len << std::endl;
           continue;
         }
 
         auto *pSliceResp = reply->add_slice_resp();
         pSliceResp->set_offset(req.offset());
-        pSliceResp->set_version(version);
 
-        // TODO: remove buffer copying
-        pSliceResp->add_data(buffer.data(), buffer.size());
+        // TODO: can we do zero copying?
+        pSliceResp->set_data(buffer, len);
       }
+
+      delete[] buffer;
     }
 
   public:
@@ -633,7 +660,7 @@ public:
 
 std::pair<int, int> GetSliceRange(int sliceCount) {
   int avgSlice = sliceCount / gNodeNum + (sliceCount % gNodeNum != 0);
-  int start = avgSlice * (gNodeId - 1);
+  int start = avgSlice * gNodeId;
 
   return {std::max(0, start - 1),
           std::min(start + avgSlice + 1, sliceCount - 1)};
@@ -952,7 +979,7 @@ private:
     if (range.first <= slice && slice <= range.second)
       return gNodeId;
     int avgSlices = nSlices / gNodeNum + (nSlices % gNodeNum != 0);
-    return 1 + slice / avgSlices;
+    return slice / avgSlices;
   }
 
   /**
@@ -966,23 +993,19 @@ private:
     size_t totalOffset = 0;
     auto *reqsForNode = new IntraReq[gNodeNum];
     std::string targetVersion = VersionSystem::GetInstance()->CurrentVersion;
-    bool isLocal = true;
-
-    auto &respman = IntraRespDataManager::GetInstance();
-    auto respmanId = respman.GetId();
 
     const auto &sliceRequests = request->slice_request();
     for (const auto &sr : sliceRequests)
       totalOffset += sr.data_len();
 
-    std::vector<uint8_t> buffer(totalOffset, 0);
+    RawBuffer buffer = new char[totalOffset];
     // std::cout << "  allocated buffer of size " << totalOffset << std::endl;
-    respman.AssociateIdAndBuffer(respmanId, &buffer);
     totalOffset = 0;
 
     std::vector<std::thread> localReadThreads;
     auto nSlices = VersionSystem::GetInstance()->GetNSlices(targetVersion);
 
+    int nNodesComm = 0;
     for (int i = 0; i < sliceRequests.size(); ++i) {
       const auto &request = sliceRequests[i];
       slice = request.slice_partition();
@@ -1000,11 +1023,12 @@ private:
       //           << std::endl;
       if (serverNodeId == gNodeId) {
         localReadThreads.emplace_back(&LocalRead, targetVersion, slice, seek,
-                                      len, &buffer, totalOffset);
+                                      len, buffer, totalOffset);
       } else {
-        isLocal = false;
+        if (reqsForNode[serverNodeId].slice_req_size() == 0)
+          ++nNodesComm;
 
-        auto *pIntraSliceReq = reqsForNode[serverNodeId - 1].add_slice_req();
+        auto *pIntraSliceReq = reqsForNode[serverNodeId].add_slice_req();
         pIntraSliceReq->set_slice_partition(slice);
         pIntraSliceReq->set_data_start(seek);
         pIntraSliceReq->set_data_len(len);
@@ -1016,21 +1040,23 @@ private:
       totalOffset += len;
     }
 
-    std::mutex mutResponse;
-    std::unique_lock<std::mutex> lkResponse(mutResponse);
-    std::condition_variable cvResponse;
+    if (nNodesComm > 0) {
+      std::mutex mutResponse;
+      std::unique_lock<std::mutex> lkResponse(mutResponse);
 
-    if (!isLocal) {
+      auto &respman = IntraRespDataManager::GetInstance();
+      auto [respmanId, pCvResponse] = respman.Register(buffer, nNodesComm);
+
       for (int i = 0; i < gNodeNum; ++i) {
-        if (i + 1 != gNodeId) {
+        if (reqsForNode[i].slice_req_size() > 0) {
           reqsForNode[i].set_id(respmanId);
+          reqsForNode[i].set_version(targetVersion);
           gIntraClients[i]->EnqueueIntraReq(reqsForNode[i]);
         }
       }
 
-      respman.AssociateIdAndCv(respmanId, &cvResponse);
-      cvResponse.wait(lkResponse,
-                      [&] { return respman.IsBatchFinished(respmanId); });
+      pCvResponse->wait(lkResponse,
+                        [&] { return respman.IsBatchFinished(respmanId); });
       // std::cout << "  intra read finished" << std::endl;
     }
 
@@ -1040,9 +1066,15 @@ private:
 
     delete[] reqsForNode;
 
-    // TODO: optimize this by removing buffer copy
-    reply->add_slice_data(buffer.data(), buffer.size());
+    totalOffset = 0;
+    for (int i = 0; i < sliceRequests.size(); ++i) {
+      size_t dataLen = sliceRequests[i].data_len();
+      reply->add_slice_data(buffer + totalOffset, dataLen);
+      totalOffset += dataLen;
+    }
     reply->set_status(0);
+
+    delete[] buffer;
   }
 
 public:
@@ -1076,7 +1108,7 @@ int ParseIntEnv(const char *envName) {
 }
 
 int main(int argc, char **argv) {
-  gNodeId = ParseIntEnv("NODE_ID");
+  gNodeId = ParseIntEnv("NODE_ID") - 1;
   gNodeNum = ParseIntEnv("NODE_NUM");
   gNodeIp = GetIpAddr();
   Log::InitLog();

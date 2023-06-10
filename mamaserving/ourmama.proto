@@ -21,8 +21,7 @@ message BatchedIntraReq {
 
 message IntraSliceResp {
     uint64 offset = 1;
-    string version = 2;
-    repeated bytes data = 3;
+    bytes data = 2;
 }
 
 message IntraResp {
