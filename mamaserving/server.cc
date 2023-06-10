@@ -57,7 +57,7 @@ using RawBuffer = char *;
 constexpr size_t KB = 1024;
 constexpr size_t MB = 1024 * KB;
 
-constexpr int parallelDownloads = 6;
+constexpr int parallelDownloads = 2;
 constexpr int queryInterval = 1500; // milliseconds
 constexpr int intraPort = 50050;
 
@@ -323,6 +323,7 @@ void GetAllNodesIp() {
           SleepMilli(queryInterval);
           continue;
         }
+
         for (auto &key : response.keys()) {
           auto ipAddr = key.substr(key.find_last_of('/') + 1);
           // TODO: add error handling
@@ -368,7 +369,7 @@ private:
   IntraRespDataManager &operator=(const IntraRespDataManager &) = delete;
 
   struct Record {
-    RawBuffer buffer;
+    MamaResponse *pMessage;
     std::condition_variable cv;
     std::atomic<uint8_t> remains;
     std::shared_mutex mutex;
@@ -382,16 +383,18 @@ public:
 
   size_t GetId() { return id_++; }
 
-  RawBuffer GetBuffer(size_t id) { return records_[id % MAX_RING_SIZE].buffer; }
+  MamaResponse *GetMessage(size_t id) {
+    return records_[id % MAX_RING_SIZE].pMessage;
+  }
 
-  std::pair<int, std::condition_variable *> Register(RawBuffer buff,
-                                                     uint8_t remains) {
-    int id = id_++;
-    int ringId = id % MAX_RING_SIZE;
+  std::pair<size_t, std::condition_variable *> Register(MamaResponse *pMessage,
+                                                        uint8_t remains) {
+    size_t id = id_++;
+    size_t ringId = id % MAX_RING_SIZE;
     auto &record = records_[ringId];
     record.mutex.lock();
 
-    record.buffer = buff;
+    record.pMessage = pMessage;
     record.remains = remains;
 
     record.mutex.unlock();
@@ -399,7 +402,7 @@ public:
   }
 
   bool IsBatchFinished(size_t id) {
-    int ringId = id % MAX_RING_SIZE;
+    size_t ringId = id % MAX_RING_SIZE;
     auto &record = records_[ringId];
     record.mutex.lock_shared();
 
@@ -410,7 +413,7 @@ public:
   }
 
   void ReportFinishedResponseFor(size_t id) {
-    int ringId = id % MAX_RING_SIZE;
+    size_t ringId = id % MAX_RING_SIZE;
     auto &record = records_[ringId];
     record.mutex.lock();
 
@@ -477,18 +480,21 @@ public:
     while (!stop_) {
       cq_.Next(&tag, &ok);
       if (unlikely(!ok)) {
-        // BOOST_LOG_TRIVIAL(error) << "failed to get response from server";
+        std::cout << "cq_.Next failed" << std::endl;
         continue;
       }
       AsyncClientCall *call = static_cast<AsyncClientCall *>(tag);
       auto &intraResp = call->reply;
 
-      RawBuffer buffer = respman.GetBuffer(intraResp.id());
-      const auto &intraSliceResps = intraResp.slice_resp();
+      // TODO: can we remove this copy?
+      auto pMessage = respman.GetMessage(intraResp.id());
+      if (!pMessage)
+        std::cout << "pMessage is nullptr for " << intraResp.id() << std::endl;
+      auto &intraSliceResps = intraResp.slice_resp();
       for (auto &sliceResp : intraSliceResps) {
         const char *copyFrom = sliceResp.data().data();
-        char *copyTo = buffer + sliceResp.offset();
-        std::copy(copyFrom, copyFrom + sliceResp.data().size(), copyTo);
+        char *copyTo = pMessage->mutable_slice_data(sliceResp.offset())->data();
+        memcpy(copyTo, copyFrom, sliceResp.data().size());
       }
       respman.ReportFinishedResponseFor(intraResp.id());
 
@@ -561,17 +567,20 @@ private:
       const auto &version = request.version();
       reply->set_id(request.id());
 
-      size_t bufferSize = 0;
-      for (const auto &req : sliceReqs)
-        bufferSize = std::max(bufferSize, req.data_len());
-      RawBuffer buffer = new char[bufferSize];
+      // size_t bufferSize = 0;
+      // for (const auto &req : sliceReqs)
+      //   bufferSize = std::max(bufferSize, req.data_len());
+      // RawBuffer buffer = new char[bufferSize];
 
       for (const auto &req : sliceReqs) {
         slice = req.slice_partition();
         seek = req.data_start();
         len = req.data_len();
 
-        if (!LocalRead(version, slice, seek, len, buffer, 0)) {
+        auto pBuffer = new std::string();
+        pBuffer->resize(len);
+
+        if (!LocalRead(version, slice, seek, len, pBuffer->data(), 0)) {
           std::cout << "LocalRead failed for " << version << " " << slice << " "
                     << seek << " " << len << std::endl;
           continue;
@@ -579,12 +588,8 @@ private:
 
         auto *pSliceResp = reply->add_slice_resp();
         pSliceResp->set_offset(req.offset());
-
-        // TODO: can we do zero copying?
-        pSliceResp->set_data(buffer, len);
+        pSliceResp->set_allocated_data(pBuffer);
       }
-
-      delete[] buffer;
     }
 
   public:
@@ -649,12 +654,12 @@ public:
   }
 }; // class IntraServiceImpl
 
-std::pair<int, int> GetSliceRange(int sliceCount) {
-  int avgSlice = sliceCount / gNodeNum + (sliceCount % gNodeNum != 0);
-  int start = avgSlice * gNodeId;
+std::pair<int, int> GetSliceRange(int sliceCount, int nodeId) {
+  int avgSlice = sliceCount / gNodeNum;
+  int quotient = sliceCount % gNodeNum;
+  int start = avgSlice * nodeId + std::min(nodeId, quotient);
 
-  return {std::max(0, start - 1),
-          std::min(start + avgSlice + 1, sliceCount - 1)};
+  return {start, start + avgSlice + (nodeId < quotient ? 1 : 0) - 1};
 }
 
 class VersionSystem {
@@ -831,9 +836,7 @@ public:
       VersionTracker::GetInstance().SetRecord(version, sliceCount);
     }
     std::cout << "  slice count = " << sliceCount << std::endl;
-    auto sliceRange = GetSliceRange(sliceCount);
-    auto start = sliceRange.first;
-    auto end = sliceRange.second;
+    auto [start, end] = GetSliceRange(sliceCount, gNodeId);
 
     // Harlan: I wanted to do `goto` but they crosses too many variable
     // initializations; macros suffices now
@@ -875,8 +878,9 @@ public:
     localDownloadTracker_.MarkNewDownload(version, end - start + 1,
                                           &cvDownload);
     if (pThreadPool_) {
+      // Cancel unfinished downloads, if any
+      pThreadPool_->ClearAllTasks();
       delete pThreadPool_;
-      pThreadPool_ = nullptr;
     }
     pThreadPool_ =
         new DownloadThreadPool(parallelDownloads, &localDownloadTracker_);
@@ -928,12 +932,14 @@ class ModelServiceImpl final : public ModelService::Service {
 private:
   int getServerIdFor(const SliceRequest &request, std::string version) {
     auto nSlices = VersionSystem::GetInstance()->GetNSlices(version);
-    auto range = GetSliceRange(nSlices);
     int slice = request.slice_partition();
-    if (range.first <= slice && slice <= range.second)
-      return gNodeId;
-    int avgSlices = nSlices / gNodeNum + (nSlices % gNodeNum != 0);
-    return slice / avgSlices;
+    for (int i = 0; i < gNodeNum; ++i) {
+      auto [start, end] = GetSliceRange(nSlices, i);
+      if (start <= slice && slice <= end)
+        return i;
+    }
+    std::cout << "ERROR: getServerIdFor(" << slice << ") failed" << std::endl;
+    return 0;
   }
 
   /**
@@ -942,17 +948,15 @@ private:
   void progress(const MamaRequest *request, MamaResponse *reply) {
     int serverNodeId;
     uint64_t slice, seek, len;
-    size_t totalOffset = 0;
     auto *reqsForNode = new IntraReq[gNodeNum];
     std::string targetVersion = VersionSystem::GetInstance()->CurrentVersion;
 
     const auto &sliceRequests = request->slice_request();
-    for (const auto &sr : sliceRequests)
-      totalOffset += sr.data_len();
+    // for (const auto &sr : sliceRequests)
+    //   totalOffset += sr.data_len();
 
-    RawBuffer buffer = new char[totalOffset];
-    // std::cout << "  allocated buffer of size " << totalOffset << std::endl;
-    totalOffset = 0;
+    // RawBuffer buffer = new char[totalOffset];
+    // totalOffset = 0;
 
     std::vector<std::thread> localReadThreads;
     auto nSlices = VersionSystem::GetInstance()->GetNSlices(targetVersion);
@@ -961,21 +965,22 @@ private:
     for (int i = 0; i < sliceRequests.size(); ++i) {
       const auto &request = sliceRequests[i];
       slice = request.slice_partition();
-      if (slice > nSlices) {
-        // TODO: handle this case
-        std::cout << "  requested " << slice << " but only " << nSlices
-                  << " slices available" << std::endl;
-        continue;
-      }
-
       seek = request.data_start();
       len = request.data_len();
+
+      // Allocate the buffer directly in the message, so we don't have to double
+      // the copying
+      auto pMessage = reply->add_slice_data();
+      pMessage->resize(len);
+      RawBuffer buffer = pMessage->data();
+
       serverNodeId = getServerIdFor(request, targetVersion);
       // std::cout << "  fetching " << slice << " from " << serverNodeId
       //           << std::endl;
       if (serverNodeId == gNodeId) {
+        // Are we creating too many threads here?
         localReadThreads.emplace_back(&LocalRead, targetVersion, slice, seek,
-                                      len, buffer, totalOffset);
+                                      len, buffer, 0);
       } else {
         if (reqsForNode[serverNodeId].slice_req_size() == 0)
           ++nNodesComm;
@@ -984,12 +989,8 @@ private:
         pIntraSliceReq->set_slice_partition(slice);
         pIntraSliceReq->set_data_start(seek);
         pIntraSliceReq->set_data_len(len);
-        // we need record data offset of slice, because only this we can put
-        // response to proper data.
-        pIntraSliceReq->set_offset(totalOffset);
+        pIntraSliceReq->set_offset(i);
       }
-
-      totalOffset += len;
     }
 
     if (nNodesComm > 0) {
@@ -997,7 +998,7 @@ private:
       std::unique_lock<std::mutex> lkResponse(mutResponse);
 
       auto &respman = IntraRespDataManager::GetInstance();
-      auto [respmanId, pCvResponse] = respman.Register(buffer, nNodesComm);
+      auto [respmanId, pCvResponse] = respman.Register(reply, nNodesComm);
 
       for (int i = 0; i < gNodeNum; ++i) {
         if (reqsForNode[i].slice_req_size() > 0) {
@@ -1018,15 +1019,15 @@ private:
 
     delete[] reqsForNode;
 
-    totalOffset = 0;
-    for (int i = 0; i < sliceRequests.size(); ++i) {
-      size_t dataLen = sliceRequests[i].data_len();
-      reply->add_slice_data(buffer + totalOffset, dataLen);
-      totalOffset += dataLen;
-    }
-    reply->set_status(0);
+    // totalOffset = 0;
+    // for (int i = 0; i < sliceRequests.size(); ++i) {
+    //   size_t dataLen = sliceRequests[i].data_len();
+    //   reply->add_slice_data(buffer + totalOffset, dataLen);
+    //   totalOffset += dataLen;
+    // }
+    // reply->set_status(0);
 
-    delete[] buffer;
+    // delete[] buffer;
   }
 
 public:

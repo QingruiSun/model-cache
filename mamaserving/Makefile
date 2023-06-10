@@ -1,9 +1,7 @@
-HOST_SYSTEM = $(shell uname | cut -f 1 -d_)
-SYSTEM ?= $(HOST_SYSTEM)
 HADDOP_VERSION = 3.3.1
 HADOOP_HOME = /opt/hadoop-$(HADOOP_VERSION)
 CPPFLAGS += `pkg-config --cflags protobuf grpc`
-CXXFLAGS += -std=c++17 -g
+CXXFLAGS += -std=c++17 -Ofast
 CXX = g++
 
 LDFLAGS += -L/usr/local/lib `pkg-config --libs protobuf grpc++` -pthread -Wl,--no-as-needed -lgrpc++_reflection -Wl,--as-needed -ldl
