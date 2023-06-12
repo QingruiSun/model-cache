@@ -55,3 +55,6 @@ etcd:
 	docker run --rm -d -e ALLOW_NONE_AUTHENTICATION=yes --name etcd --network $(IMAGE)  docker.io/bitnami/etcd:3.5
 custom: alimama.pb.o alimama.grpc.pb.o custom.o
 	${CXX} -std=c++17 ${CPPFLAGS} $^ $(LDFLAGS) -o $@
+
+pyproto:
+	python3 -m grpc_tools.protoc -I. --python_out=. --pyi_out=. --grpc_python_out=. ./alimama.proto

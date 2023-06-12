@@ -10,12 +10,10 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <deque>
+#include <dlfcn.h>
 #include <etcd/Client.hpp>
 #include <etcd/Response.hpp>
-#include <etcd/Watcher.hpp>
-#include <grpcpp/ext/proto_server_reflection_plugin.h>
 #include <grpcpp/grpcpp.h>
-#include <grpcpp/health_check_service_interface.h>
 #include <hdfs/hdfs.h>
 #include <ifaddrs.h>
 #include <iostream>
@@ -27,22 +25,15 @@
 #include <string>
 #include <sys/socket.h>
 #include <thread>
+#include <unistd.h>
 #include <unordered_map>
-
-// namespace logging = boost::log;
-// namespace sinks = boost::log::sinks;
-// namespace expr = boost::log::expressions;
-// namespace keywords = boost::log::keywords;
 
 using MamaRequest = alimama::proto::Request;
 using MamaResponse = alimama::proto::Response;
 using SliceRequest = alimama::proto::SliceRequest;
 using alimama::proto::ModelService;
 
-using IntraSliceReq = ourmama::proto::IntraSliceReq;
 using IntraReq = ourmama::proto::IntraReq;
-using BatchedIntraReq = ourmama::proto::BatchedIntraReq;
-using IntraSliceResp = ourmama::proto::IntraSliceResp;
 using IntraResp = ourmama::proto::IntraResp;
 using ourmama::proto::IntraService;
 
@@ -58,7 +49,7 @@ constexpr size_t KB = 1024;
 constexpr size_t MB = 1024 * KB;
 
 constexpr int parallelDownloads = 2;
-constexpr int queryInterval = 1500; // milliseconds
+constexpr int queryInterval = 2500; // milliseconds
 constexpr int intraPort = 50050;
 
 const std::string etcdUrl = "http://etcd:2379";
@@ -87,11 +78,12 @@ private:
     return FMT("./model_%1%/model_slice.%2$03d", Version_ % slice);
   }
 
-public:
-  const std::string Version_;
   int start_;
   int cnt_;
   std::vector<ModelSliceReader *> readers_;
+
+public:
+  const std::string Version_;
 
   SliceCache(std::string version, int start, int cnt)
       : Version_(version), start_(start), cnt_(cnt) {}
@@ -103,7 +95,6 @@ public:
       readers_[i] = new ModelSliceReader();
       readers_[i]->Load(targetPath(start_ + i));
     }
-    gSliceCaches.push_back(this);
   }
 
   bool Has(int slice) { return slice >= start_ && slice < start_ + cnt_; }
@@ -115,18 +106,14 @@ public:
     }
   }
 
-  void Read(int slice, size_t seek, size_t len, RawBuffer buffer,
-            size_t bufferOffset) {
-    char *targetMem = buffer + bufferOffset;
-    readers_[slice - start_]->Read(seek, len, targetMem);
+  void Read(int slice, size_t seek, size_t len, RawBuffer buffer) {
+    readers_[slice - start_]->Read(seek, len, buffer);
   }
 }; // class SliceCache
 
 std::string GetIpAddr() {
   struct ifaddrs *addresses;
   if (getifaddrs(&addresses) == -1) {
-    // BOOST_LOG_TRIVIAL(error)
-    //     << "server-" << gNodeId << " Error occurred in getifaddrs!";
     return "";
   }
 
@@ -142,8 +129,6 @@ std::string GetIpAddr() {
     if (strcmp(ipAddr.c_str(), "127.0.0.1") == 0)
       continue;
 
-    // BOOST_LOG_TRIVIAL(info)
-    //     << "The local ip address parse succeed, is " << ipAddr;
     break;
   }
 
@@ -199,7 +184,6 @@ private:
   std::unordered_map<std::string, std::condition_variable *> versionCv_;
 }; // class LocalDownloadTracker
 
-// we use a thread pool to download file from hdfs to control resouce usage
 class DownloadThreadPool {
 private:
   struct HdfsModelPath {
@@ -262,9 +246,10 @@ public:
     tasks_ = {}; // this clear queue
   }
 
-  void InsertTask(std::string version, int slice) {
+  void InsertTask(std::string version, std::pair<int, int> &&sliceRange) {
     std::unique_lock<std::mutex> lock(queueMutex_);
-    tasks_.emplace(version, slice);
+    for (int i = sliceRange.first; i <= sliceRange.second; ++i)
+      tasks_.emplace(version, i);
     this->condition_.notify_one();
   }
 
@@ -360,7 +345,7 @@ static void UnregisterVersion(std::string modelVersion) {
 
 class IntraRespDataManager {
 private:
-  static constexpr size_t MAX_RING_SIZE = 0x5600;
+  static constexpr size_t MAX_RING_SIZE = 0x6000;
 
   std::atomic<size_t> id_ = 0;
 
@@ -443,6 +428,13 @@ public:
     parseRespThread_ = std::thread(&IntraServiceClient::ParseResponse, this);
   }
 
+  ~IntraServiceClient() {
+    stop_ = true;
+    condition_.notify_all();
+    sendReqThread_.detach();
+    parseRespThread_.detach();
+  }
+
   void EnqueueIntraReq(const IntraReq intraReq) {
     std::unique_lock<std::mutex> lock(queueMutex_);
     queue_.push(intraReq);
@@ -458,17 +450,13 @@ public:
         std::swap(tempQueue, queue_);
       }
 
-      // we can batch many `IntraReq`s to a `BatchedIntraReq`.
-      BatchedIntraReq batchedReq;
       while (!tempQueue.empty()) {
-        auto *pRecord = batchedReq.add_req();
-        pRecord->CopyFrom(tempQueue.front());
+        AsyncClientCall *call = new AsyncClientCall();
+        call->responseReader =
+            stub_->AsyncGet(&call->context, tempQueue.front(), &cq_);
         tempQueue.pop();
+        call->responseReader->Finish(&call->reply, &call->status, (void *)call);
       }
-
-      AsyncClientCall *call = new AsyncClientCall();
-      call->responseReader = stub_->AsyncGet(&call->context, batchedReq, &cq_);
-      call->responseReader->Finish(&call->reply, &call->status, (void *)call);
     }
   }
 
@@ -490,11 +478,13 @@ public:
       auto pMessage = respman.GetMessage(intraResp.id());
       if (!pMessage)
         std::cout << "pMessage is nullptr for " << intraResp.id() << std::endl;
-      auto &intraSliceResps = intraResp.slice_resp();
-      for (auto &sliceResp : intraSliceResps) {
-        const char *copyFrom = sliceResp.data().data();
-        char *copyTo = pMessage->mutable_slice_data(sliceResp.offset())->data();
-        memcpy(copyTo, copyFrom, sliceResp.data().size());
+      const int N = intraResp.data().size();
+      for (int i = 0; i < N; ++i) {
+        const auto &slice = intraResp.data(i);
+        const char *copyFrom = slice.data();
+        char *copyTo =
+            pMessage->mutable_slice_data(intraResp.offset(i))->data();
+        memcpy(copyTo, copyFrom, slice.size());
       }
       respman.ReportFinishedResponseFor(intraResp.id());
 
@@ -528,20 +518,8 @@ void EstablishIntraConn() {
   }
 }
 
-/**
- @returns `true` if succeeds, `false` otherwise.
- */
-bool LocalRead(const std::string &version, uint64_t slice, uint64_t seek,
-               uint64_t len, RawBuffer buffer, size_t bufferOffset) {
-  for (auto pCache : gSliceCaches) {
-    if (pCache->Version_ == version && pCache->Has(slice)) {
-      pCache->Read(slice, seek, len, buffer, bufferOffset);
-      return true;
-    }
-  }
-
-  std::cout << "LocalRead failed to find slice in cache" << std::endl;
-  return false;
+void LocalRead(uint64_t slice, uint64_t seek, uint64_t len, RawBuffer buffer) {
+  gSliceCaches.back()->Read(slice, seek, len, buffer);
 }
 
 class IntraServiceImpl final {
@@ -556,7 +534,7 @@ private:
     grpc::ServerCompletionQueue *cq_;
     grpc::ServerContext ctx_;
     grpc::ServerAsyncResponseWriter<IntraResp> responder_;
-    BatchedIntraReq batchedReq_;
+    IntraReq intraReq_;
     IntraResp intraResp_;
     enum CallStatus { CREATE, PROCESS, FINISH };
     CallStatus status_;
@@ -564,31 +542,20 @@ private:
     void processRequest(const IntraReq &request, IntraResp *reply) {
       uint64_t slice, seek, len;
       const auto &sliceReqs = request.slice_req();
-      const auto &version = request.version();
+      const int N = sliceReqs.size();
       reply->set_id(request.id());
 
-      // size_t bufferSize = 0;
-      // for (const auto &req : sliceReqs)
-      //   bufferSize = std::max(bufferSize, req.data_len());
-      // RawBuffer buffer = new char[bufferSize];
-
-      for (const auto &req : sliceReqs) {
+      for (int i = 0; i < N; ++i) {
+        const auto &req = sliceReqs[i];
         slice = req.slice_partition();
         seek = req.data_start();
         len = req.data_len();
 
-        auto pBuffer = new std::string();
-        pBuffer->resize(len);
+        reply->add_offset(request.offset(i));
+        auto d = reply->add_data();
+        d->resize(len);
 
-        if (!LocalRead(version, slice, seek, len, pBuffer->data(), 0)) {
-          std::cout << "LocalRead failed for " << version << " " << slice << " "
-                    << seek << " " << len << std::endl;
-          continue;
-        }
-
-        auto *pSliceResp = reply->add_slice_resp();
-        pSliceResp->set_offset(req.offset());
-        pSliceResp->set_allocated_data(pBuffer);
+        LocalRead(slice, seek, len, d->data());
       }
     }
 
@@ -602,18 +569,14 @@ private:
     void Proceed() {
       if (status_ == CREATE) {
         status_ = PROCESS;
-        service_->RequestGet(&ctx_, &batchedReq_, &responder_, cq_, cq_, this);
+        service_->RequestGet(&ctx_, &intraReq_, &responder_, cq_, cq_, this);
       } else if (status_ == PROCESS) {
         new CallData(service_, cq_);
-        for (const auto &intraReq : batchedReq_.req())
-          processRequest(intraReq, &intraResp_);
+        processRequest(intraReq_, &intraResp_);
         status_ = FINISH;
         responder_.Finish(intraResp_, Status::OK, this);
-      } else if (status_ == FINISH) {
+      } else
         delete this;
-      } else {
-        // BOOST_LOG_TRIVIAL(error) << "Unknown status";
-      }
     }
   }; // class CallData
 
@@ -626,7 +589,6 @@ public:
     bool ok;
     while (true) {
       cq_->Next(&tag, &ok);
-      // GPR_ASSERT(ok);
       static_cast<CallData *>(tag)->Proceed();
     }
   }
@@ -638,9 +600,8 @@ public:
     cq_->Shutdown();
   }
 
-  // There is no shutdown handling in this code.
   void Run(uint16_t port) {
-    std::string server_address = FMT("0.0.0.0:%1%", port);
+    std::string server_address = std::string("0.0.0.0:") + std::to_string(port);
 
     grpc::ServerBuilder builder;
     builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());
@@ -649,7 +610,9 @@ public:
     server_ = builder.BuildAndStart();
     std::cout << "Server listening on " << server_address << std::endl;
 
-    for (int i = 0; i < 8; ++i)
+    // constexpr int nThreads = 6;
+    constexpr int nThreads = 1;
+    for (int i = 0; i < nThreads; ++i)
       threads_.emplace_back(&IntraServiceImpl::HandleRPCs, this);
   }
 }; // class IntraServiceImpl
@@ -684,43 +647,44 @@ private:
     }
   }; // class VersionTracker
 
-  static void watchOtherNodesLoad(std::string version,
-                                  std::atomic<bool> *pIsDlFinished,
-                                  std::condition_variable *pCv) {
+  static void waitForOtherNodesToLoad(std::string version) {
+    static boost::format fmter(etcdVersionSyncPrefixFmt);
+
     while (true) {
       etcd::Client client(etcdUrl);
-      auto prefix = FMT(etcdVersionSyncPrefixFmt, version);
+      auto prefix = boost::str(boost::format(fmter) % version);
       auto task = client.ls(prefix);
       auto response = task.get();
       std::cout << "[etcd] ls " << prefix << " got " << response.keys().size()
                 << " keys" << std::endl;
-      if (response.keys().size() == gNodeNum) {
-        pIsDlFinished->store(true);
-        pCv->notify_one();
+      if (response.keys().size() == gNodeNum)
         return;
-      }
+
       SleepMilli(queryInterval);
     }
   }
 
-  /**
-   @param cv condition variable to notify when all nodes have loaded the
-   specified version
-   */
-  void watchOtherNodesLoadAsync(std::string version,
-                                std::atomic<bool> &isDlFinished,
-                                std::condition_variable &cv) {
-    auto t = std::thread(&VersionSystem::watchOtherNodesLoad, version,
-                         &isDlFinished, &cv);
-    t.detach();
+  int getVersionSliceCountFromHdfs(hdfsFS &fs, std::string modelVersion) {
+    int numEntries = 0;
+    std::string path = FMT("/model_%1%/", modelVersion);
+
+    hdfsFileInfo *fileInfo = hdfsListDirectory(fs, path.c_str(), &numEntries);
+    if (likely(fileInfo != nullptr && numEntries > 0)) {
+      hdfsFreeFileInfo(fileInfo, numEntries);
+      return numEntries - 2;
+    } else {
+      std::cout << "  hdfs: list directory " << path << " failed" << std::endl;
+      return 0;
+    }
   }
 
-  void loadToMem(std::string version, int start, int cnt) {
+  // Assuming the version pointed by pSliceCaches.back() is the latest
+  SliceCache *loadToMem(std::string version, int start, int cnt) {
     if (gSliceCaches.size() > 2) {
       std::cout << "  popping out old cache" << std::endl;
 
       auto *pOldCache = gSliceCaches.front();
-      const auto &oldVersion = pOldCache->Version_;
+      const auto oldVersion = pOldCache->Version_;
       gSliceCaches.pop_front();
       pOldCache->Unload();
       EtcdService::UnregisterVersion(oldVersion);
@@ -728,13 +692,15 @@ private:
     }
 
     std::cout << "  Preparing new cache" << std::endl;
-    (new SliceCache(version, start, cnt))->Load();
+    auto pCache = new SliceCache(version, start, cnt);
+    pCache->Load();
+    return pCache;
   }
 
   VersionSystem() = default;
 
 public:
-  std::string CurrentVersion = "WAIT";
+  std::string CurrentVersion_ = "WAIT";
 
   static VersionSystem *GetInstance() {
     static VersionSystem instance;
@@ -771,7 +737,7 @@ public:
         hdfsRead(fs, rbFile, buffer, versionBufferSize);
         hdfsCloseFile(fs, rbFile);
 
-        ret = std::string(buffer);
+        ret = std::string(buffer).substr(6);
         goto cleanup;
       } else if (filename.find("model_") == 0) {
         // Starting with model_ means it could be valid version.
@@ -795,68 +761,52 @@ public:
     }
 
   cleanup:
-    if (fileInfo != nullptr && numEntries > 0)
+    if (likely(fileInfo != nullptr && numEntries > 0))
       hdfsFreeFileInfo(fileInfo, numEntries);
     return ret;
-  }
-
-  int GetVersionSliceCount(std::string modelVersion) {
-    int numEntries = 0;
-    hdfsFS fs = hdfsConnect("hdfs://namenode", 9000);
-    std::string path = FMT("/model_%1%/", modelVersion);
-
-    hdfsFileInfo *fileInfo = hdfsListDirectory(fs, path.c_str(), &numEntries);
-    if (unlikely(fileInfo == nullptr || numEntries == 0)) {
-      // TODO: handle this
-      goto cleanup;
-    }
-
-  cleanup:
-    hdfsFreeFileInfo(fileInfo, numEntries);
-    return numEntries - 2;
   }
 
   /**
    Only downloads and loads into mem <b>if necessary</b>. This function is
    synchronous and supposedly takes a few minutes to finish on the slow path.
    */
-  void DownloadVersionAndLoadIntoMem(std::string version) {
+  void DownloadVersionAndLoadIntoMem(hdfsFS &fs, std::string version) {
     std::mutex mutDownload;
     std::unique_lock<std::mutex> lkDownload(mutDownload);
     std::condition_variable cvDownload;
 
-    std::atomic<bool> isDlFinished(false);
-    std::mutex mutOthersReady;
-    std::unique_lock<std::mutex> lkOthersReady(mutOthersReady);
-    std::condition_variable cvOthersReady;
-
     auto sliceCount = VersionTracker::GetInstance().GetNSlices(version);
     if (!sliceCount) {
-      sliceCount = GetVersionSliceCount(version);
+      sliceCount = getVersionSliceCountFromHdfs(fs, version);
       VersionTracker::GetInstance().SetRecord(version, sliceCount);
     }
     std::cout << "  slice count = " << sliceCount << std::endl;
     auto [start, end] = GetSliceRange(sliceCount, gNodeId);
 
+    SliceCache *newSliceCache = nullptr;
+
     // Harlan: I wanted to do `goto` but they crosses too many variable
     // initializations; macros suffices now
 #define REGISTER_ETCD()                                                        \
   std::cout << "  Registering onto etcd" << std::endl;                         \
-  watchOtherNodesLoadAsync(version, isDlFinished, cvOthersReady);              \
   EtcdService::RegisterVersion(version);                                       \
-  cvOthersReady.wait(lkOthersReady, [&] { return isDlFinished.load(); });      \
+  waitForOtherNodesToLoad(version);                                            \
+  assert(newSliceCache != nullptr);                                            \
+  gSliceCaches.push_back(newSliceCache);                                       \
   std::cout << "  DownloadVersionAndLoadIntoMem exiting..." << std::endl;
 
 #define LOAD_MEM()                                                             \
   std::cout << "  Loading into mem" << std::endl;                              \
-  loadToMem(version, start, end - start + 1);                                  \
+  newSliceCache = loadToMem(version, start, end - start + 1);                  \
   REGISTER_ETCD();
 
     /// 1. check if the version is already loaded in mem
     std::cout << "[1] checking if version " << version << " is in ram"
               << std::endl;
-    for (auto &pCache : gSliceCaches) {
-      if (pCache->Version_ == version) {
+    for (int i = 0; i < gSliceCaches.size(); ++i) {
+      if (gSliceCaches[i]->Version_ == version) {
+        newSliceCache = gSliceCaches[i];
+        gSliceCaches.erase(gSliceCaches.begin() + i);
         REGISTER_ETCD();
         return;
       }
@@ -886,8 +836,7 @@ public:
         new DownloadThreadPool(parallelDownloads, &localDownloadTracker_);
     std::cout << "  download pool created" << std::endl;
     InjectDownloadThreadPool(pThreadPool_);
-    for (int i = start; i <= end; ++i)
-      pThreadPool_->InsertTask(version, i);
+    pThreadPool_->InsertTask(version, {start, end});
 
     // wait for download tasks to finish
     cvDownload.wait(lkDownload, [&] {
@@ -905,17 +854,17 @@ public:
 
     while (!gIsExiting) {
       std::string newVersion = LatestVersionOn(fs);
-      if (newVersion != "WAIT" && CurrentVersion != newVersion) {
-        std::cout << "Current version: " << CurrentVersion
+      if (newVersion != "WAIT" && CurrentVersion_ != newVersion) {
+        std::cout << "Current version: " << CurrentVersion_
                   << ", new version: " << newVersion << std::endl;
         std::cout << "Getting version " << newVersion << std::endl;
-        DownloadVersionAndLoadIntoMem(newVersion);
-        if (CurrentVersion == "WAIT") {
+        DownloadVersionAndLoadIntoMem(fs, newVersion);
+        if (CurrentVersion_ == "WAIT") {
           // We're required to register this service onto Etcd
           std::cout << "Registering public interface" << std::endl;
           EtcdService::RegisterModelService();
         }
-        CurrentVersion = std::move(newVersion);
+        CurrentVersion_ = std::move(newVersion);
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(queryInterval));
     }
@@ -926,13 +875,15 @@ public:
   size_t GetNSlices(std::string version) {
     return VersionTracker::GetInstance().GetNSlices(version);
   }
+
+  size_t GetNSlices() { return GetNSlices(CurrentVersion_); }
 }; // class VersionSystem
 
 class ModelServiceImpl final : public ModelService::Service {
 private:
-  int getServerIdFor(const SliceRequest &request, std::string version) {
-    auto nSlices = VersionSystem::GetInstance()->GetNSlices(version);
-    int slice = request.slice_partition();
+  using LocalReadTask = std::tuple<uint64_t, uint64_t, uint64_t, RawBuffer>;
+
+  int getServerIdFor(int slice, int nSlices) {
     for (int i = 0; i < gNodeNum; ++i) {
       auto [start, end] = GetSliceRange(nSlices, i);
       if (start <= slice && slice <= end)
@@ -943,23 +894,46 @@ private:
   }
 
   /**
+   * @brief Unused function; might be useful in the future (though not very
+   * likely).
+   */
+  void localReadAsync(std::vector<LocalReadTask> &&tasks) {
+    constexpr int nParallelReads = 2;
+    std::vector<std::thread> threads;
+
+    std::string version;
+    uint64_t slice, seek, len;
+    RawBuffer buffer;
+
+    const int nTasks = tasks.size();
+    const int groupEnd = nTasks - (nTasks % nParallelReads);
+    for (int start = 0; start < groupEnd; start += nParallelReads) {
+      for (int subtask = 0; subtask < nParallelReads; ++subtask) {
+        std::tie(slice, seek, len, buffer) = tasks[start + subtask];
+        threads.emplace_back(&LocalRead, slice, seek, len, buffer);
+      }
+      for (auto &t : threads)
+        t.join();
+      threads.clear();
+    }
+
+    for (int i = groupEnd; i < nTasks; ++i) {
+      std::tie(slice, seek, len, buffer) = tasks[i];
+      threads.emplace_back(&LocalRead, slice, seek, len, buffer);
+    }
+    for (auto &t : threads)
+      t.join();
+  }
+
+  /**
    Synchronous function. It will block until the data is ready.
    */
   void progress(const MamaRequest *request, MamaResponse *reply) {
     int serverNodeId;
     uint64_t slice, seek, len;
-    auto *reqsForNode = new IntraReq[gNodeNum];
-    std::string targetVersion = VersionSystem::GetInstance()->CurrentVersion;
-
+    auto reqsForNode = new IntraReq[gNodeNum];
     const auto &sliceRequests = request->slice_request();
-    // for (const auto &sr : sliceRequests)
-    //   totalOffset += sr.data_len();
-
-    // RawBuffer buffer = new char[totalOffset];
-    // totalOffset = 0;
-
-    std::vector<std::thread> localReadThreads;
-    auto nSlices = VersionSystem::GetInstance()->GetNSlices(targetVersion);
+    auto nSlices = VersionSystem::GetInstance()->GetNSlices();
 
     int nNodesComm = 0;
     for (int i = 0; i < sliceRequests.size(); ++i) {
@@ -968,28 +942,23 @@ private:
       seek = request.data_start();
       len = request.data_len();
 
-      // Allocate the buffer directly in the message, so we don't have to double
-      // the copying
+      // Allocate the buffer directly in the message, so we don't have to
+      // double the copying
       auto pMessage = reply->add_slice_data();
       pMessage->resize(len);
       RawBuffer buffer = pMessage->data();
 
-      serverNodeId = getServerIdFor(request, targetVersion);
-      // std::cout << "  fetching " << slice << " from " << serverNodeId
-      //           << std::endl;
+      serverNodeId = getServerIdFor(slice, nSlices);
       if (serverNodeId == gNodeId) {
-        // Are we creating too many threads here?
-        localReadThreads.emplace_back(&LocalRead, targetVersion, slice, seek,
-                                      len, buffer, 0);
+        // From what it appears on benchmarks, it looks like synchronous reading
+        // is enough right now
+        LocalRead(slice, seek, len, buffer);
       } else {
-        if (reqsForNode[serverNodeId].slice_req_size() == 0)
+        auto &nodeReq = reqsForNode[serverNodeId];
+        if (nodeReq.slice_req_size() == 0)
           ++nNodesComm;
-
-        auto *pIntraSliceReq = reqsForNode[serverNodeId].add_slice_req();
-        pIntraSliceReq->set_slice_partition(slice);
-        pIntraSliceReq->set_data_start(seek);
-        pIntraSliceReq->set_data_len(len);
-        pIntraSliceReq->set_offset(i);
+        nodeReq.add_offset(i);
+        nodeReq.add_slice_req()->CopyFrom(request);
       }
     }
 
@@ -1003,31 +972,16 @@ private:
       for (int i = 0; i < gNodeNum; ++i) {
         if (reqsForNode[i].slice_req_size() > 0) {
           reqsForNode[i].set_id(respmanId);
-          reqsForNode[i].set_version(targetVersion);
           gIntraClients[i]->EnqueueIntraReq(reqsForNode[i]);
         }
       }
 
       pCvResponse->wait(lkResponse,
                         [&] { return respman.IsBatchFinished(respmanId); });
-      // std::cout << "  intra read finished" << std::endl;
     }
 
-    for (auto &t : localReadThreads)
-      t.join();
-    // std::cout << "  local read finished" << std::endl;
-
     delete[] reqsForNode;
-
-    // totalOffset = 0;
-    // for (int i = 0; i < sliceRequests.size(); ++i) {
-    //   size_t dataLen = sliceRequests[i].data_len();
-    //   reply->add_slice_data(buffer + totalOffset, dataLen);
-    //   totalOffset += dataLen;
-    // }
-    // reply->set_status(0);
-
-    // delete[] buffer;
+    reply->set_status(0);
   }
 
 public:
@@ -1042,8 +996,6 @@ static void RunPublicGrpc() {
   std::string serverAddr("0.0.0.0:50051");
   ModelServiceImpl service;
 
-  grpc::EnableDefaultHealthCheckService(true);
-  grpc::reflection::InitProtoReflectionServerBuilderPlugin();
   grpc::ServerBuilder grpcServerBuilder;
   grpcServerBuilder.AddListeningPort(serverAddr,
                                      grpc::InsecureServerCredentials());
@@ -1060,7 +1012,25 @@ int ParseIntEnv(const char *envName) {
   return std::stoi(envStr);
 }
 
+/**
+ * @brief Since we don't have a proper way to end this program, we need a way to
+ * handle exits gracefully, so that `gprof` can generate the profiling data.
+ * Excerpted from StackOverflow.
+ */
+void sigUsr1Handler(int sig) {
+  std::cout << "Exiting on SIGUSR1" << std::endl;
+  void (*_mcleanup)(void);
+  _mcleanup = (void (*)(void))dlsym(RTLD_DEFAULT, "_mcleanup");
+  if (_mcleanup == NULL)
+    std::cout << "Unable to find gprof exit hook" << std::endl;
+  else
+    _mcleanup();
+  _exit(0);
+}
+
 int main(int argc, char **argv) {
+  signal(SIGUSR1, sigUsr1Handler);
+
   gNodeId = ParseIntEnv("NODE_ID") - 1;
   gNodeNum = ParseIntEnv("NODE_NUM");
   gNodeIp = GetIpAddr();

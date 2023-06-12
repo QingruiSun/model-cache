@@ -1,34 +1,21 @@
 syntax = "proto3";
 
+import "alimama.proto";
+
 package ourmama.proto;
 
-message IntraSliceReq {
-    uint64 slice_partition = 1;
-    uint64 data_start = 2;
-    uint64 data_len = 3;
-    uint64 offset = 4;
-}
-
 message IntraReq {
-    uint64 id = 1;
-    string version = 2;
-    repeated IntraSliceReq slice_req = 3;
-}
-
-message BatchedIntraReq {
-    repeated IntraReq req = 1;
-}
-
-message IntraSliceResp {
-    uint64 offset = 1;
-    bytes data = 2;
+    uint64 id = 1; // session id
+    repeated uint64 offset = 2; // which task in the session
+    repeated alimama.proto.SliceRequest slice_req = 3;
 }
 
 message IntraResp {
     uint64 id = 1;
-    repeated IntraSliceResp slice_resp = 2;
+    repeated uint64 offset = 2;
+    repeated bytes data = 3;
 }
 
 service IntraService {
-    rpc Get(BatchedIntraReq) returns (IntraResp) {}
+    rpc Get(IntraReq) returns (IntraResp) {}
 }
