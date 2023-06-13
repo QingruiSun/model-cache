@@ -1,4 +1,6 @@
 echo "this is node $NODE_ID out of $NODE_NUM"
+echo "waiting for etcd server to fully start up"
+sleep 7
 cd mamaserving && ./server
 # cd mamaserving && env LD_PRELOAD="/gperftools/build/lib/libtcmalloc.so" HEAPCHECK=normal  ./server
 

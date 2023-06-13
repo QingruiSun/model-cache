@@ -6,8 +6,9 @@ package ourmama.proto;
 
 message IntraReq {
     uint64 id = 1; // session id
-    repeated uint64 offset = 2; // which task in the session
-    repeated alimama.proto.SliceRequest slice_req = 3;
+    uint32 gen = 2; // version generation id
+    repeated uint64 offset = 3; // which task in the session
+    repeated alimama.proto.SliceRequest slice_req = 4;
 }
 
 message IntraResp {

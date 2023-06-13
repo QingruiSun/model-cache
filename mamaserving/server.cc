@@ -13,6 +13,7 @@
 #include <dlfcn.h>
 #include <etcd/Client.hpp>
 #include <etcd/Response.hpp>
+#include <etcd/Watcher.hpp>
 #include <grpcpp/grpcpp.h>
 #include <hdfs/hdfs.h>
 #include <ifaddrs.h>
@@ -49,7 +50,6 @@ using RawBuffer = char *;
 constexpr size_t KB = 1024;
 constexpr size_t MB = 1024 * KB;
 
-constexpr int parallelDownloads = 2;
 constexpr int queryInterval = 2500; // milliseconds
 constexpr int intraPort = 50050;
 
@@ -71,200 +71,13 @@ void SleepMilli(int ms) {
   std::this_thread::sleep_for(std::chrono::milliseconds(ms));
 }
 
-class SliceCache;
-std::deque<SliceCache *> gSliceCaches;
-class SliceCache {
-private:
-  std::string targetPath(int slice) {
-    return FMT("./model_%1%/model_slice.%2$03d", Version_ % slice);
-  }
-
-  int start_;
-  int cnt_;
-  std::vector<ModelSliceReader *> readers_;
-
-public:
-  const std::string Version_;
-
-  SliceCache(std::string version, int start, int cnt)
-      : Version_(version), start_(start), cnt_(cnt) {}
-
-  void Load() {
-    readers_.resize(cnt_);
-    for (int i = 0; i < cnt_; i++) {
-      // TODO: what if a version switch happens during load
-      readers_[i] = new ModelSliceReader();
-      readers_[i]->Load(targetPath(start_ + i));
-    }
-  }
-
-  bool Has(int slice) { return slice >= start_ && slice < start_ + cnt_; }
-
-  void Unload() {
-    for (auto reader : readers_) {
-      reader->Unload();
-      delete reader;
-    }
-  }
-
-  void Read(int slice, size_t seek, size_t len, RawBuffer buffer) {
-    readers_[slice - start_]->Read(seek, len, buffer);
-  }
-}; // class SliceCache
-
-std::string GetIpAddr() {
-  struct ifaddrs *addresses;
-  if (getifaddrs(&addresses) == -1) {
-    return "";
-  }
-
-  std::string ipAddr;
-  for (struct ifaddrs *addr = addresses; addr != nullptr;
-       addr = addr->ifa_next) {
-    if (addr->ifa_addr == nullptr || addr->ifa_addr->sa_family != AF_INET)
-      continue;
-
-    const struct sockaddr_in *sockaddr =
-        reinterpret_cast<const struct sockaddr_in *>(addr->ifa_addr);
-    ipAddr = inet_ntoa(sockaddr->sin_addr);
-    if (strcmp(ipAddr.c_str(), "127.0.0.1") == 0)
-      continue;
-
-    break;
-  }
-
-  freeifaddrs(addresses);
-  return ipAddr;
+// trim from end (in place)
+static inline void rtrim(std::string &s) {
+  s.erase(std::find_if(s.rbegin(), s.rend(),
+                       [](unsigned char ch) { return !std::isspace(ch); })
+              .base(),
+          s.end());
 }
-
-class LocalDownloadTracker {
-public:
-  void RecordDownloadedSlice(std::string version, int slice) {
-    std::cout << "  > " << version << "[" << slice << "] finished" << std::endl;
-    std::unique_lock lock(mutex_);
-
-    auto &versionRecord = ivr_[version];
-    versionRecord.finishedSlices.insert(slice);
-    if (versionRecord.finished()) {
-      std::cout << "  >> " << version << " all finished" << std::endl;
-      finishedVersions_.insert(version);
-      versionCv_[version]->notify_one();
-    }
-  }
-
-  bool IsSliceDownloaded(std::string version, int slice) {
-    std::shared_lock lock(mutex_);
-
-    auto &fins = ivr_[version].finishedSlices;
-    return fins.count(slice) > 0;
-  }
-
-  bool IsVersionDownloaded(std::string version) {
-    std::shared_lock lock(mutex_);
-    return finishedVersions_.count(version) > 0;
-  }
-
-  void MarkNewDownload(std::string version, int requiredSlices,
-                       std::condition_variable *cv) {
-    std::unique_lock lock(mutex_);
-    ivr_[version].requiredSlices = requiredSlices;
-    versionCv_[version] = cv;
-  }
-
-private:
-  struct InternalVersionRecord {
-    int requiredSlices;
-    std::unordered_set<int> finishedSlices;
-
-    bool finished() { return requiredSlices == finishedSlices.size(); }
-  };
-
-  std::shared_mutex mutex_;
-  std::unordered_map<std::string, InternalVersionRecord> ivr_;
-  std::unordered_set<std::string> finishedVersions_;
-  std::unordered_map<std::string, std::condition_variable *> versionCv_;
-}; // class LocalDownloadTracker
-
-class DownloadThreadPool {
-private:
-  struct HdfsModelPath {
-    std::string version;
-    uint64_t slice;
-
-    HdfsModelPath(std::string version, uint64_t slice)
-        : version(version), slice(slice) {}
-  };
-
-public:
-  DownloadThreadPool(int nThreads, LocalDownloadTracker *pLocalDownloadTracker)
-      : stop_(false), pLocalDownloadTracker_(pLocalDownloadTracker) {
-    for (int i = 0; i < nThreads; ++i)
-      workers_.emplace_back(&DownloadThreadPool::ThreadFunc, this);
-  }
-
-  ~DownloadThreadPool() {
-    {
-      std::unique_lock<std::mutex> lock(queueMutex_);
-      stop_ = true;
-    }
-    condition_.notify_all();
-    for (std::thread &worker : workers_)
-      worker.join();
-  }
-
-  void DownloadSliceFromHdfs(std::string version, int slice) {
-    std::string command = FMT("mkdir -p ./model_%1%", version);
-    std::cout << "  dispatching command: " << command << std::endl;
-    system(command.c_str());
-
-    command = FMT("/opt/hadoop-3.3.1/bin/hadoop fs -get "
-                  "hdfs://namenode:9000/model_%1%/model_slice.%2$03d "
-                  "./model_%1%/model_slice.%2$03d",
-                  version % slice);
-    std::cout << "  dispatching command: " << command << std::endl;
-    system(command.c_str());
-    pLocalDownloadTracker_->RecordDownloadedSlice(version, slice);
-  }
-
-  void ThreadFunc() {
-    while (true) {
-      std::unique_lock<std::mutex> lock(this->queueMutex_);
-      this->condition_.wait(
-          lock, [this] { return this->stop_ || !this->tasks_.empty(); });
-      if (this->stop_ && this->tasks_.empty())
-        return;
-      HdfsModelPath hdfsPath = tasks_.front();
-      tasks_.pop();
-      lock.unlock();
-      DownloadSliceFromHdfs(hdfsPath.version, hdfsPath.slice);
-    }
-  }
-
-  // we need call this function when see new model version or roll back, because
-  // we don't need to download old slice from hdfs.
-  void ClearAllTasks() {
-    std::unique_lock<std::mutex> lock(queueMutex_);
-    tasks_ = {}; // this clear queue
-  }
-
-  void InsertTask(std::string version, std::pair<int, int> &&sliceRange) {
-    std::unique_lock<std::mutex> lock(queueMutex_);
-    for (int i = sliceRange.first; i <= sliceRange.second; ++i)
-      tasks_.emplace(version, i);
-    this->condition_.notify_one();
-  }
-
-  // Harlan: I moved it to public since it is accessed in a lambda function,
-  // and with GCC's impl of C++ 11 lambda, it can't access private members.
-  std::queue<HdfsModelPath> tasks_;
-
-private:
-  std::vector<std::thread> workers_;
-  std::mutex queueMutex_;
-  std::condition_variable condition_;
-  bool stop_;
-  LocalDownloadTracker *pLocalDownloadTracker_;
-}; // class DownLoadThreadPool
 
 namespace EtcdService {
 #define LAUNCH_ETCD_TASK(keyStr, opStr)                                        \
@@ -292,7 +105,26 @@ void rm(std::string key) {
 #undef LAUNCH_ETCD_TASK
 
 void RegisterIntra() {
-  set(FMT(etcdIntraDiscoveryFmt, gNodeIp), std::getenv("NODE_ID"));
+  etcd::Client client(etcdUrl);
+  while (true) {
+    try {
+      auto response =
+          client
+              .set(FMT(etcdIntraDiscoveryFmt, gNodeIp), std::getenv("NODE_ID"))
+              .get();
+      if (response.is_ok()) {
+        std::cout << "RegisterIntra success" << std::endl;
+        return;
+      } else {
+        std::cout << "RegisterIntra: failed; reason: "
+                  << response.error_message() << "; retrying..." << std::endl;
+        SleepMilli(queryInterval);
+      }
+    } catch (const std::exception &e) {
+      std::cout << "RegisterIntra: exception: " << e.what() << std::endl;
+      SleepMilli(queryInterval);
+    }
+  }
 }
 
 void GetAllNodesIp() {
@@ -343,6 +175,144 @@ static void UnregisterVersion(std::string modelVersion) {
   rm(FMT(etcdVersionSyncNodeFmt, modelVersion % gNodeId));
 }
 } // namespace EtcdService
+
+class SliceCache {
+private:
+  std::string targetPath(int slice) {
+    return FMT("./model_%1%/model_slice.%2$03d", Version_ % slice);
+  }
+
+  int start_;
+  int cnt_;
+  std::vector<ModelSliceReader *> readers_;
+
+  inline static std::queue<std::shared_ptr<SliceCache>> caches_;
+  inline static std::mutex mutCv_;
+  inline static std::shared_mutex mutP_;
+  inline static std::condition_variable cvCache_;
+
+  void load() {
+    readers_.resize(cnt_);
+    for (int i = 0; i < cnt_; i++) {
+      // TODO: what if a version switch happens during load
+      readers_[i] = new ModelSliceReader();
+      readers_[i]->Load(targetPath(start_ + i));
+    }
+  }
+
+  void unload() {
+    for (auto reader : readers_) {
+      reader->Unload();
+      delete reader;
+    }
+  }
+
+  static void handleWatcher(const etcd::Response &_resp,
+                            std::atomic<int> &syncCnt) {
+    std::cout << "Watcher: current synccnt: " << syncCnt << std::endl;
+    if ((++syncCnt) == gNodeNum)
+      cvCache_.notify_one();
+  }
+
+public:
+  const std::string Version_;
+  uint32_t GenId_;
+
+  using SyncRecord = std::pair<std::atomic<int> *, etcd::Watcher *>;
+
+  SliceCache(std::string version, uint32_t genId, int start, int cnt)
+      : Version_(version), GenId_(genId), start_(start), cnt_(cnt) {}
+
+  static std::shared_ptr<SliceCache> Get() {
+    std::shared_lock lk(mutP_);
+    return caches_.back();
+  }
+
+  static std::shared_ptr<SliceCache> Get(uint32_t genId) {
+    std::shared_lock lk(mutP_);
+    return caches_.front()->GenId_ == genId  ? caches_.front()
+           : caches_.back()->GenId_ == genId ? caches_.back()
+                                             : nullptr;
+  }
+
+  /* must be called before UpdateSync */
+  static SyncRecord ScheduleSync(std::string version) {
+    static std::atomic<int> syncCnt;
+
+    syncCnt = 0;
+    auto start =
+        boost::str(boost::format(etcdVersionSyncNodeFmt) % version % 0);
+    auto end =
+        boost::str(boost::format(etcdVersionSyncNodeFmt) % version % gNodeNum);
+    return {&syncCnt, new etcd::Watcher(etcdUrl, start, end,
+                                        [&](const etcd::Response &_resp) {
+                                          handleWatcher(_resp, syncCnt);
+                                        })};
+  }
+
+  static void UpdateSync(SyncRecord record, std::string version, uint32_t genId,
+                         int start, int cnt) {
+    std::atomic<int> *syncCnt = record.first;
+    etcd::Watcher *pWatcher = record.second;
+
+    std::cout << "SliceCache::UpdateSync" << std::endl;
+    // 1. Prepare the new version
+    std::shared_ptr<SliceCache> newCache =
+        std::make_shared<SliceCache>(version, genId, start, cnt);
+    newCache->load();
+    // 2. Tell everyone else I'm ready to switch
+    EtcdService::RegisterVersion(version);
+    // 3. Wait for everyone else to finish switching
+    {
+      std::unique_lock lock(mutCv_);
+      cvCache_.wait(lock, [=] { return *syncCnt == gNodeNum; });
+    }
+
+    std::cout << "SliceCache::UpdateSync: everyone is ready" << std::endl;
+    pWatcher->Cancel();
+    delete pWatcher;
+    {
+      std::unique_lock lock(mutP_);
+      if (caches_.size() == 2)
+        caches_.pop();
+      caches_.push(newCache);
+    }
+  }
+
+  void Read(int slice, size_t seek, size_t len, RawBuffer buffer) {
+    readers_[slice - start_]->Read(seek, len, buffer);
+  }
+
+  ~SliceCache() {
+    EtcdService::UnregisterVersion(Version_);
+    unload();
+  }
+}; // class SliceCache
+
+std::string GetIpAddr() {
+  struct ifaddrs *addresses;
+  if (getifaddrs(&addresses) == -1) {
+    return "";
+  }
+
+  std::string ipAddr;
+  for (struct ifaddrs *addr = addresses; addr != nullptr;
+       addr = addr->ifa_next) {
+    if (addr->ifa_addr == nullptr || addr->ifa_addr->sa_family != AF_INET)
+      continue;
+
+    const struct sockaddr_in *sockaddr =
+        reinterpret_cast<const struct sockaddr_in *>(addr->ifa_addr);
+    ipAddr = inet_ntoa(sockaddr->sin_addr);
+    if (strcmp(ipAddr.c_str(), "127.0.0.1") == 0)
+      continue;
+
+    break;
+  }
+
+  freeifaddrs(addresses);
+  return ipAddr;
+}
 
 class IntraRespDataManager {
 private:
@@ -519,8 +489,9 @@ void EstablishIntraConn() {
   }
 }
 
-void LocalRead(uint64_t slice, uint64_t seek, uint64_t len, RawBuffer buffer) {
-  gSliceCaches.back()->Read(slice, seek, len, buffer);
+void LocalRead(std::shared_ptr<SliceCache> pSc, uint64_t slice, uint64_t seek,
+               uint64_t len, RawBuffer buffer) {
+  pSc->Read(slice, seek, len, buffer);
 }
 
 class IntraServiceImpl final {
@@ -544,7 +515,13 @@ private:
       uint64_t slice, seek, len;
       const auto &sliceReqs = request.slice_req();
       const int N = sliceReqs.size();
+      const auto genId = request.gen();
       reply->set_id(request.id());
+      auto pCache = SliceCache::Get(genId);
+      if (!pCache) {
+        std::cout << "[FATAL] pCache is nullptr for " << genId << std::endl;
+        return;
+      }
 
       for (int i = 0; i < N; ++i) {
         const auto &req = sliceReqs[i];
@@ -556,7 +533,7 @@ private:
         auto d = reply->add_data();
         d->resize(len);
 
-        LocalRead(slice, seek, len, d->data());
+        LocalRead(pCache, slice, seek, len, d->data());
       }
     }
 
@@ -628,42 +605,26 @@ std::pair<int, int> GetSliceRange(int sliceCount, int nodeId) {
 
 class VersionSystem {
 private:
-  LocalDownloadTracker localDownloadTracker_;
-  DownloadThreadPool *pThreadPool_;
-
   class VersionTracker {
-    std::unordered_map<std::string, size_t> record_;
+    std::unordered_map<std::string, std::pair<bool, size_t>> record_;
     VersionTracker() = default;
 
   public:
-    size_t GetNSlices(std::string version) { return record_[version]; }
+    size_t GetNSlices(std::string version) { return record_[version].second; }
 
-    void SetRecord(std::string version, size_t nSlices) {
-      record_[version] = nSlices;
+    void SetNSlices(std::string version, size_t nSlices) {
+      record_[version].second = nSlices;
     }
+
+    bool IsDownloaded(std::string version) { return record_[version].first; }
+
+    void SetDownloaded(std::string version) { record_[version].first = true; }
 
     static VersionTracker &GetInstance() {
       static VersionTracker instance;
       return instance;
     }
   }; // class VersionTracker
-
-  static void waitForOtherNodesToLoad(std::string version) {
-    static boost::format fmter(etcdVersionSyncPrefixFmt);
-
-    while (true) {
-      etcd::Client client(etcdUrl);
-      auto prefix = boost::str(boost::format(fmter) % version);
-      auto task = client.ls(prefix);
-      auto response = task.get();
-      std::cout << "[etcd] ls " << prefix << " got " << response.keys().size()
-                << " keys" << std::endl;
-      if (response.keys().size() == gNodeNum)
-        return;
-
-      SleepMilli(queryInterval);
-    }
-  }
 
   int getVersionSliceCountFromHdfs(hdfsFS &fs, std::string modelVersion) {
     int numEntries = 0;
@@ -680,28 +641,17 @@ private:
   }
 
   // Assuming the version pointed by pSliceCaches.back() is the latest
-  SliceCache *loadToMem(std::string version, int start, int cnt) {
-    if (gSliceCaches.size() > 2) {
-      std::cout << "  popping out old cache" << std::endl;
-
-      auto *pOldCache = gSliceCaches.front();
-      const auto oldVersion = pOldCache->Version_;
-      gSliceCaches.pop_front();
-      pOldCache->Unload();
-      EtcdService::UnregisterVersion(oldVersion);
-      delete pOldCache;
-    }
-
+  void loadToMem(SliceCache::SyncRecord syncRecord, std::string version,
+                 uint32_t genId, int start, int cnt) {
     std::cout << "  Preparing new cache" << std::endl;
-    auto pCache = new SliceCache(version, start, cnt);
-    pCache->Load();
-    return pCache;
+    SliceCache::UpdateSync(syncRecord, version, genId, start, cnt);
   }
 
   VersionSystem() = default;
 
 public:
   std::string CurrentVersion_ = "WAIT";
+  std::atomic<uint32_t> GenId_ = 0;
 
   static VersionSystem *GetInstance() {
     static VersionSystem instance;
@@ -735,6 +685,7 @@ public:
         hdfsCloseFile(fs, rbFile);
 
         order = std::string(buffer).substr(6);
+        rtrim(order);
         std::cout << "rollback.version == " << order << std::endl;
         goto cleanup;
       } else if (filename.find("model_") == 0) {
@@ -762,32 +713,25 @@ public:
 
   void downloadVersionFrom(hdfsFS &fs, std::string version, int start,
                            int end) {
-    std::mutex mutDownload;
-    std::unique_lock<std::mutex> lkDownload(mutDownload);
-    std::condition_variable cvDownload;
+    static boost::format fmter(
+        "/opt/hadoop-3.3.1/bin/hadoop fs -get "
+        "hdfs://namenode:9000/model_%1%/model_slice.%2$03d "
+        "./model_%1%/model_slice.%2$03d");
 
-    if (pThreadPool_) {
-      // Cancel unfinished downloads, if any
-      pThreadPool_->ClearAllTasks();
-      delete pThreadPool_;
-    }
-    pThreadPool_ =
-        new DownloadThreadPool(parallelDownloads, &localDownloadTracker_);
-    std::cout << "  download pool created" << std::endl;
+    std::string command = FMT("mkdir -p ./model_%1%", version);
+    std::cout << "  dispatching command: " << command << std::endl;
+    system(command.c_str());
 
     std::cout << "  Downloading version " << version << std::endl;
     std::cout << "  planned download: [" << start << ", " << end << "]"
               << std::endl;
-    localDownloadTracker_.MarkNewDownload(version, end - start + 1,
-                                          &cvDownload);
-    pThreadPool_->InsertTask(version, {start, end});
+    for (int i = start; i <= end; ++i) {
+      command = boost::str(boost::format(fmter) % version % i);
+      std::cout << "  dispatching command: " << command << std::endl;
+      system(command.c_str());
+    }
 
-    cvDownload.wait(lkDownload, [&] {
-      return localDownloadTracker_.IsVersionDownloaded(version);
-    });
-
-    delete pThreadPool_;
-    pThreadPool_ = nullptr;
+    VersionTracker::GetInstance().SetDownloaded(version);
   }
 
   /**
@@ -797,69 +741,46 @@ public:
   void DownloadVersionAndOptionallyLoad(hdfsFS &fs,
                                         std::vector<std::string> versions,
                                         bool shouldPreload = false) {
-    auto sliceCount = VersionTracker::GetInstance().GetNSlices(versions[0]);
+    auto versionTracker = VersionTracker::GetInstance();
+    auto targetVer = versions[0];
+    auto sliceCount = versionTracker.GetNSlices(targetVer);
     if (!sliceCount) {
-      sliceCount = getVersionSliceCountFromHdfs(fs, versions[0]);
-      VersionTracker::GetInstance().SetRecord(versions[0], sliceCount);
+      sliceCount = getVersionSliceCountFromHdfs(fs, targetVer);
+      VersionTracker::GetInstance().SetNSlices(targetVer, sliceCount);
     }
     std::cout << "  slice count = " << sliceCount << std::endl;
     auto [start, end] = GetSliceRange(sliceCount, gNodeId);
 
-    SliceCache *newSliceCache = nullptr;
+    auto syncSchedule = SliceCache::ScheduleSync(targetVer);
+    ++GenId_;
 
-    // Harlan: I wanted to do `goto` but they crosses too many variable
-    // initializations; macros suffices now
-#define REGISTER_ETCD()                                                        \
-  std::cout << "  Registering onto etcd" << std::endl;                         \
-  EtcdService::RegisterVersion(versions[0]);                                   \
-  waitForOtherNodesToLoad(versions[0]);                                        \
-  assert(newSliceCache != nullptr);                                            \
-  gSliceCaches.push_back(newSliceCache);                                       \
-  std::cout << "  DownloadVersionAndLoad exiting..." << std::endl;
-
-#define LOAD_MEM()                                                             \
-  std::cout << "  Loading into mem" << std::endl;                              \
-  newSliceCache = loadToMem(versions[0], start, end - start + 1);              \
-  REGISTER_ETCD();
-
-    /// 1. check if the version is already loaded in mem
-    std::cout << "[1] checking if versions[0] " << versions[0] << " is in ram"
+    /// 1. check if the version is already downloaded to local disk
+    std::cout << "[1] checking if version " << targetVer << " is on disk"
               << std::endl;
-    for (int i = 0; i < gSliceCaches.size(); ++i) {
-      if (gSliceCaches[i]->Version_ == versions[0]) {
-        newSliceCache = gSliceCaches[i];
-        gSliceCaches.erase(gSliceCaches.begin() + i);
-        REGISTER_ETCD();
-        return;
-      }
-    }
-
-    /// 2. check if the version is already downloaded to local disk
-    std::cout << "[2] checking if versions[0] " << versions[0] << " is in disk"
-              << std::endl;
-    if (localDownloadTracker_.IsVersionDownloaded(versions[0])) {
-      LOAD_MEM();
+    if (versionTracker.IsDownloaded(targetVer)) {
+      std::cout << "  Loading into mem" << std::endl;
+      loadToMem(syncSchedule, targetVer, GenId_, start, end - start + 1);
       return;
     }
 
-    /// 3. the normal slow path
-    std::cout << "[3] downloading versions[0] " << versions[0] << " from hdfs"
+    /// 2. the normal slow path
+    std::cout << "[2] downloading versions[0] " << targetVer << " from hdfs"
               << std::endl;
-    downloadVersionFrom(fs, versions[0], start, end);
+    downloadVersionFrom(fs, targetVer, start, end);
 
     if (shouldPreload) {
-      std::cout << "[4] attempting to preload other versions" << std::endl;
+      std::cout << "[3] attempting to preload other versions" << std::endl;
       for (int i = 1; i < versions.size(); ++i) {
-        std::cout << "  Preloading version " << versions[i] << std::endl;
+        std::cout << "  Preloading versions[" << i << "]: " << versions[i]
+                  << std::endl;
         downloadVersionFrom(fs, versions[i], start, end);
         std::cout << "  >> Preloading version " << versions[i] << " done"
                   << std::endl;
       }
     }
 
-    LOAD_MEM();
-#undef LOAD_MEM
-#undef REGISTER_ETCD
+    std::cout << "  Loading into mem" << std::endl;
+    loadToMem(syncSchedule, targetVer, GenId_, start, end - start + 1);
   }
 
   void Run() {
@@ -912,38 +833,6 @@ private:
   }
 
   /**
-   * @brief Unused function; might be useful in the future (though not very
-   * likely).
-   */
-  void localReadAsync(std::vector<LocalReadTask> &&tasks) {
-    constexpr int nParallelReads = 2;
-    std::vector<std::thread> threads;
-
-    std::string version;
-    uint64_t slice, seek, len;
-    RawBuffer buffer;
-
-    const int nTasks = tasks.size();
-    const int groupEnd = nTasks - (nTasks % nParallelReads);
-    for (int start = 0; start < groupEnd; start += nParallelReads) {
-      for (int subtask = 0; subtask < nParallelReads; ++subtask) {
-        std::tie(slice, seek, len, buffer) = tasks[start + subtask];
-        threads.emplace_back(&LocalRead, slice, seek, len, buffer);
-      }
-      for (auto &t : threads)
-        t.join();
-      threads.clear();
-    }
-
-    for (int i = groupEnd; i < nTasks; ++i) {
-      std::tie(slice, seek, len, buffer) = tasks[i];
-      threads.emplace_back(&LocalRead, slice, seek, len, buffer);
-    }
-    for (auto &t : threads)
-      t.join();
-  }
-
-  /**
    Synchronous function. It will block until the data is ready.
    */
   void progress(const MamaRequest *request, MamaResponse *reply) {
@@ -952,6 +841,7 @@ private:
     auto reqsForNode = new IntraReq[gNodeNum];
     const auto &sliceRequests = request->slice_request();
     auto nSlices = VersionSystem::GetInstance()->GetNSlices();
+    auto pCache = SliceCache::Get();
 
     int nNodesComm = 0;
     for (int i = 0; i < sliceRequests.size(); ++i) {
@@ -970,7 +860,7 @@ private:
       if (serverNodeId == gNodeId) {
         // From what it appears on benchmarks, it looks like synchronous reading
         // is enough right now
-        LocalRead(slice, seek, len, buffer);
+        LocalRead(pCache, slice, seek, len, buffer);
       } else {
         auto &nodeReq = reqsForNode[serverNodeId];
         if (nodeReq.slice_req_size() == 0)
@@ -990,6 +880,7 @@ private:
       for (int i = 0; i < gNodeNum; ++i) {
         if (reqsForNode[i].slice_req_size() > 0) {
           reqsForNode[i].set_id(respmanId);
+          reqsForNode[i].set_gen(pCache->GenId_);
           gIntraClients[i]->EnqueueIntraReq(reqsForNode[i]);
         }
       }
