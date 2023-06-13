@@ -20,6 +20,7 @@
 #include <memory>
 #include <mutex>
 #include <netinet/in.h>
+#include <optional>
 #include <queue>
 #include <shared_mutex>
 #include <string>
@@ -707,20 +708,16 @@ public:
     return &instance;
   }
 
-  void InjectDownloadThreadPool(DownloadThreadPool *pPool) {
-    pThreadPool_ = pPool;
-  }
-
-  std::string LatestVersionOn(hdfsFS &fs) {
+  std::vector<std::string> LatestVersionOn(hdfsFS &fs) {
     constexpr size_t versionBufferSize = 1024;
 
     int numEntries;
-    std::string ret;
+    std::string order;
     std::vector<std::string> dirs;
 
     hdfsFileInfo *fileInfo = hdfsListDirectory(fs, "/", &numEntries);
     if (unlikely(fileInfo == nullptr || numEntries == 0)) {
-      ret = "WAIT";
+      order = "WAIT";
       std::cout << "[WARN] no version found" << std::endl;
       goto cleanup;
     }
@@ -737,48 +734,73 @@ public:
         hdfsRead(fs, rbFile, buffer, versionBufferSize);
         hdfsCloseFile(fs, rbFile);
 
-        ret = std::string(buffer).substr(6);
+        order = std::string(buffer).substr(6);
+        std::cout << "rollback.version == " << order << std::endl;
         goto cleanup;
       } else if (filename.find("model_") == 0) {
         // Starting with model_ means it could be valid version.
         // check if the model.done file exists, if not exists, we need wait
         // until model load to hdfs finished.
         std::string modelDonePath = FMT("/%1%/model.done", filename);
-        if (hdfsGetPathInfo(fs, modelDonePath.c_str()) == NULL) {
-          std::cout << modelDonePath << " doesn't exist" << std::endl;
+        if (hdfsGetPathInfo(fs, modelDonePath.c_str()) == NULL)
           continue;
-        }
 
         dirs.push_back(filename.substr(6)); // removing the 'model_' in front
       }
     }
 
     sort(dirs.rbegin(), dirs.rend());
-    if (!dirs.empty()) {
-      ret = dirs[0];
-    } else {
-      ret = "WAIT"; // this situation may occur when start.
+    if (dirs.empty()) {
+      order = "WAIT"; // this situation may occur when start.
     }
 
   cleanup:
     if (likely(fileInfo != nullptr && numEntries > 0))
       hdfsFreeFileInfo(fileInfo, numEntries);
-    return ret;
+    return order.empty() ? std::move(dirs) : std::vector{order};
+  }
+
+  void downloadVersionFrom(hdfsFS &fs, std::string version, int start,
+                           int end) {
+    std::mutex mutDownload;
+    std::unique_lock<std::mutex> lkDownload(mutDownload);
+    std::condition_variable cvDownload;
+
+    if (pThreadPool_) {
+      // Cancel unfinished downloads, if any
+      pThreadPool_->ClearAllTasks();
+      delete pThreadPool_;
+    }
+    pThreadPool_ =
+        new DownloadThreadPool(parallelDownloads, &localDownloadTracker_);
+    std::cout << "  download pool created" << std::endl;
+
+    std::cout << "  Downloading version " << version << std::endl;
+    std::cout << "  planned download: [" << start << ", " << end << "]"
+              << std::endl;
+    localDownloadTracker_.MarkNewDownload(version, end - start + 1,
+                                          &cvDownload);
+    pThreadPool_->InsertTask(version, {start, end});
+
+    cvDownload.wait(lkDownload, [&] {
+      return localDownloadTracker_.IsVersionDownloaded(version);
+    });
+
+    delete pThreadPool_;
+    pThreadPool_ = nullptr;
   }
 
   /**
    Only downloads and loads into mem <b>if necessary</b>. This function is
    synchronous and supposedly takes a few minutes to finish on the slow path.
    */
-  void DownloadVersionAndLoadIntoMem(hdfsFS &fs, std::string version) {
-    std::mutex mutDownload;
-    std::unique_lock<std::mutex> lkDownload(mutDownload);
-    std::condition_variable cvDownload;
-
-    auto sliceCount = VersionTracker::GetInstance().GetNSlices(version);
+  void DownloadVersionAndOptionallyLoad(hdfsFS &fs,
+                                        std::vector<std::string> versions,
+                                        bool shouldPreload = false) {
+    auto sliceCount = VersionTracker::GetInstance().GetNSlices(versions[0]);
     if (!sliceCount) {
-      sliceCount = getVersionSliceCountFromHdfs(fs, version);
-      VersionTracker::GetInstance().SetRecord(version, sliceCount);
+      sliceCount = getVersionSliceCountFromHdfs(fs, versions[0]);
+      VersionTracker::GetInstance().SetRecord(versions[0], sliceCount);
     }
     std::cout << "  slice count = " << sliceCount << std::endl;
     auto [start, end] = GetSliceRange(sliceCount, gNodeId);
@@ -789,22 +811,22 @@ public:
     // initializations; macros suffices now
 #define REGISTER_ETCD()                                                        \
   std::cout << "  Registering onto etcd" << std::endl;                         \
-  EtcdService::RegisterVersion(version);                                       \
-  waitForOtherNodesToLoad(version);                                            \
+  EtcdService::RegisterVersion(versions[0]);                                   \
+  waitForOtherNodesToLoad(versions[0]);                                        \
   assert(newSliceCache != nullptr);                                            \
   gSliceCaches.push_back(newSliceCache);                                       \
-  std::cout << "  DownloadVersionAndLoadIntoMem exiting..." << std::endl;
+  std::cout << "  DownloadVersionAndLoad exiting..." << std::endl;
 
 #define LOAD_MEM()                                                             \
   std::cout << "  Loading into mem" << std::endl;                              \
-  newSliceCache = loadToMem(version, start, end - start + 1);                  \
+  newSliceCache = loadToMem(versions[0], start, end - start + 1);              \
   REGISTER_ETCD();
 
     /// 1. check if the version is already loaded in mem
-    std::cout << "[1] checking if version " << version << " is in ram"
+    std::cout << "[1] checking if versions[0] " << versions[0] << " is in ram"
               << std::endl;
     for (int i = 0; i < gSliceCaches.size(); ++i) {
-      if (gSliceCaches[i]->Version_ == version) {
+      if (gSliceCaches[i]->Version_ == versions[0]) {
         newSliceCache = gSliceCaches[i];
         gSliceCaches.erase(gSliceCaches.begin() + i);
         REGISTER_ETCD();
@@ -813,38 +835,29 @@ public:
     }
 
     /// 2. check if the version is already downloaded to local disk
-    std::cout << "[2] checking if version " << version << " is in disk"
+    std::cout << "[2] checking if versions[0] " << versions[0] << " is in disk"
               << std::endl;
-    if (localDownloadTracker_.IsVersionDownloaded(version)) {
+    if (localDownloadTracker_.IsVersionDownloaded(versions[0])) {
       LOAD_MEM();
       return;
     }
 
     /// 3. the normal slow path
-    std::cout << "[3] downloading version " << version << " from hdfs"
+    std::cout << "[3] downloading versions[0] " << versions[0] << " from hdfs"
               << std::endl;
-    std::cout << "  planned download: [" << start << ", " << end << "]"
-              << std::endl;
-    localDownloadTracker_.MarkNewDownload(version, end - start + 1,
-                                          &cvDownload);
-    if (pThreadPool_) {
-      // Cancel unfinished downloads, if any
-      pThreadPool_->ClearAllTasks();
-      delete pThreadPool_;
-    }
-    pThreadPool_ =
-        new DownloadThreadPool(parallelDownloads, &localDownloadTracker_);
-    std::cout << "  download pool created" << std::endl;
-    InjectDownloadThreadPool(pThreadPool_);
-    pThreadPool_->InsertTask(version, {start, end});
+    downloadVersionFrom(fs, versions[0], start, end);
 
-    // wait for download tasks to finish
-    cvDownload.wait(lkDownload, [&] {
-      return localDownloadTracker_.IsVersionDownloaded(version);
-    });
+    if (shouldPreload) {
+      std::cout << "[4] attempting to preload other versions" << std::endl;
+      for (int i = 1; i < versions.size(); ++i) {
+        std::cout << "  Preloading version " << versions[i] << std::endl;
+        downloadVersionFrom(fs, versions[i], start, end);
+        std::cout << "  >> Preloading version " << versions[i] << " done"
+                  << std::endl;
+      }
+    }
 
     LOAD_MEM();
-
 #undef LOAD_MEM
 #undef REGISTER_ETCD
   }
@@ -853,13 +866,18 @@ public:
     hdfsFS fs = hdfsConnect("hdfs://namenode", 9000);
 
     while (!gIsExiting) {
-      std::string newVersion = LatestVersionOn(fs);
+      auto versions = LatestVersionOn(fs);
+      auto newVersion = versions[0];
       if (newVersion != "WAIT" && CurrentVersion_ != newVersion) {
         std::cout << "Current version: " << CurrentVersion_
                   << ", new version: " << newVersion << std::endl;
         std::cout << "Getting version " << newVersion << std::endl;
-        DownloadVersionAndLoadIntoMem(fs, newVersion);
-        if (CurrentVersion_ == "WAIT") {
+
+        bool isFirstLoad = CurrentVersion_ == "WAIT";
+        // We have the choice to download all the versions beforehand. As it
+        // appears, it's not against the rules
+        DownloadVersionAndOptionallyLoad(fs, versions, isFirstLoad);
+        if (isFirstLoad) {
           // We're required to register this service onto Etcd
           std::cout << "Registering public interface" << std::endl;
           EtcdService::RegisterModelService();
