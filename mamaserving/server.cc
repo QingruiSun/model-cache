@@ -179,14 +179,15 @@ static void UnregisterVersion(std::string modelVersion) {
 class SliceCache {
 private:
   std::string targetPath(int slice) {
-    return FMT("./model_%1%/model_slice.%2$03d", Version_ % slice);
+    static boost::format fmter("./model_%1%/model_slice.%2$03d");
+    return boost::str(boost::format(fmter) % Version_ % slice);
   }
 
   int start_;
   int cnt_;
   std::vector<ModelSliceReader *> readers_;
 
-  inline static std::queue<std::shared_ptr<SliceCache>> caches_;
+  inline static std::queue<SliceCache *> caches_;
   inline static std::mutex mutCv_;
   inline static std::shared_mutex mutP_;
   inline static std::condition_variable cvCache_;
@@ -207,11 +208,11 @@ private:
     }
   }
 
-  static void handleWatcher(const etcd::Response &_resp,
-                            std::atomic<int> &syncCnt) {
+  static void resolveWatcherEvent(const etcd::Response &_resp,
+                                  std::atomic<int> &syncCnt) {
     std::cout << "Watcher: current synccnt: " << syncCnt << std::endl;
     if ((++syncCnt) == gNodeNum)
-      cvCache_.notify_one();
+      cvCache_.notify_all();
   }
 
 public:
@@ -223,19 +224,19 @@ public:
   SliceCache(std::string version, uint32_t genId, int start, int cnt)
       : Version_(version), GenId_(genId), start_(start), cnt_(cnt) {}
 
-  static std::shared_ptr<SliceCache> Get() {
+  static SliceCache *Get() {
     std::shared_lock lk(mutP_);
     return caches_.back();
   }
 
-  static std::shared_ptr<SliceCache> Get(uint32_t genId) {
+  static SliceCache *Get(uint32_t genId) {
     std::shared_lock lk(mutP_);
-    return caches_.front()->GenId_ == genId  ? caches_.front()
-           : caches_.back()->GenId_ == genId ? caches_.back()
-                                             : nullptr;
+    return caches_.back()->GenId_ == genId    ? caches_.back()
+           : caches_.front()->GenId_ == genId ? caches_.front()
+                                              : nullptr;
   }
 
-  /* must be called before UpdateSync */
+  /* must be called before DoSync */
   static SyncRecord ScheduleSync(std::string version) {
     static std::atomic<int> syncCnt;
 
@@ -246,37 +247,48 @@ public:
         boost::str(boost::format(etcdVersionSyncNodeFmt) % version % gNodeNum);
     return {&syncCnt, new etcd::Watcher(etcdUrl, start, end,
                                         [&](const etcd::Response &_resp) {
-                                          handleWatcher(_resp, syncCnt);
+                                          resolveWatcherEvent(_resp, syncCnt);
                                         })};
   }
 
-  static void UpdateSync(SyncRecord record, std::string version, uint32_t genId,
-                         int start, int cnt) {
+  static void DoSync(SyncRecord record, std::string version, uint32_t genId,
+                     int start, int cnt) {
+    mutP_.lock_shared();
+    auto currentCacheSize = caches_.size();
+    mutP_.unlock_shared();
+
+    if (currentCacheSize >= 2) {
+      mutP_.lock();
+      auto oldCache = caches_.front();
+      caches_.pop();
+      mutP_.unlock();
+
+      delete oldCache;
+    }
+
     std::atomic<int> *syncCnt = record.first;
     etcd::Watcher *pWatcher = record.second;
 
-    std::cout << "SliceCache::UpdateSync" << std::endl;
+    std::cout << "SliceCache::DoSync" << std::endl;
     // 1. Prepare the new version
-    std::shared_ptr<SliceCache> newCache =
-        std::make_shared<SliceCache>(version, genId, start, cnt);
+    auto newCache = new SliceCache(version, genId, start, cnt);
     newCache->load();
     // 2. Tell everyone else I'm ready to switch
     EtcdService::RegisterVersion(version);
-    // 3. Wait for everyone else to finish switching
+    // 3. Wait for everyone else to get ready
     {
       std::unique_lock lock(mutCv_);
       cvCache_.wait(lock, [=] { return *syncCnt == gNodeNum; });
     }
 
-    std::cout << "SliceCache::UpdateSync: everyone is ready" << std::endl;
-    pWatcher->Cancel();
-    delete pWatcher;
+    std::cout << "SliceCache::DoSync: everyone is ready" << std::endl;
     {
       std::unique_lock lock(mutP_);
-      if (caches_.size() == 2)
-        caches_.pop();
       caches_.push(newCache);
     }
+
+    pWatcher->Cancel();
+    delete pWatcher;
   }
 
   void Read(int slice, size_t seek, size_t len, RawBuffer buffer) {
@@ -489,8 +501,8 @@ void EstablishIntraConn() {
   }
 }
 
-void LocalRead(std::shared_ptr<SliceCache> pSc, uint64_t slice, uint64_t seek,
-               uint64_t len, RawBuffer buffer) {
+void LocalRead(SliceCache *pSc, uint64_t slice, uint64_t seek, uint64_t len,
+               RawBuffer buffer) {
   pSc->Read(slice, seek, len, buffer);
 }
 
@@ -514,15 +526,14 @@ private:
     void processRequest(const IntraReq &request, IntraResp *reply) {
       uint64_t slice, seek, len;
       const auto &sliceReqs = request.slice_req();
-      const int N = sliceReqs.size();
       const auto genId = request.gen();
-      reply->set_id(request.id());
       auto pCache = SliceCache::Get(genId);
       if (!pCache) {
         std::cout << "[FATAL] pCache is nullptr for " << genId << std::endl;
         return;
       }
 
+      const int N = sliceReqs.size();
       for (int i = 0; i < N; ++i) {
         const auto &req = sliceReqs[i];
         slice = req.slice_partition();
@@ -535,6 +546,8 @@ private:
 
         LocalRead(pCache, slice, seek, len, d->data());
       }
+
+      reply->set_id(request.id());
     }
 
   public:
@@ -644,7 +657,7 @@ private:
   void loadToMem(SliceCache::SyncRecord syncRecord, std::string version,
                  uint32_t genId, int start, int cnt) {
     std::cout << "  Preparing new cache" << std::endl;
-    SliceCache::UpdateSync(syncRecord, version, genId, start, cnt);
+    SliceCache::DoSync(syncRecord, version, genId, start, cnt);
   }
 
   VersionSystem() = default;
@@ -686,7 +699,7 @@ public:
 
         order = std::string(buffer).substr(6);
         rtrim(order);
-        std::cout << "rollback.version == " << order << std::endl;
+        // std::cout << "rollback.version == " << order << std::endl;
         goto cleanup;
       } else if (filename.find("model_") == 0) {
         // Starting with model_ means it could be valid version.
@@ -803,9 +816,9 @@ public:
           std::cout << "Registering public interface" << std::endl;
           EtcdService::RegisterModelService();
         }
-        CurrentVersion_ = std::move(newVersion);
+        CurrentVersion_ = newVersion;
       }
-      std::this_thread::sleep_for(std::chrono::milliseconds(queryInterval));
+      SleepMilli(3500);
     }
 
     hdfsDisconnect(fs);
@@ -872,7 +885,7 @@ private:
 
     if (nNodesComm > 0) {
       std::mutex mutResponse;
-      std::unique_lock<std::mutex> lkResponse(mutResponse);
+      std::unique_lock lkResponse(mutResponse);
 
       auto &respman = IntraRespDataManager::GetInstance();
       auto [respmanId, pCvResponse] = respman.Register(reply, nNodesComm);
