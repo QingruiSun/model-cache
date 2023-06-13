@@ -71,12 +71,13 @@ void SleepMilli(int ms) {
   std::this_thread::sleep_for(std::chrono::milliseconds(ms));
 }
 
-// trim from end (in place)
-static inline void rtrim(std::string &s) {
+// trim from end
+static inline std::string rtrim(std::string s) {
   s.erase(std::find_if(s.rbegin(), s.rend(),
                        [](unsigned char ch) { return !std::isspace(ch); })
               .base(),
           s.end());
+  return s;
 }
 
 namespace EtcdService {
@@ -184,16 +185,14 @@ private:
   }
 
   int start_;
-  int cnt_;
+  int cnt_ = 0;
+  bool ready_ = false;
   std::vector<ModelSliceReader *> readers_;
 
-  inline static std::queue<SliceCache *> caches_;
-  inline static std::mutex mutCv_;
-  inline static std::shared_mutex mutP_;
+  inline static SliceCache *(caches_[2]);
   inline static std::condition_variable cvCache_;
 
   void load() {
-    readers_.resize(cnt_);
     for (int i = 0; i < cnt_; i++) {
       // TODO: what if a version switch happens during load
       readers_[i] = new ModelSliceReader();
@@ -202,10 +201,12 @@ private:
   }
 
   void unload() {
-    for (auto reader : readers_) {
-      reader->Unload();
-      delete reader;
+    EtcdService::UnregisterVersion(Version_);
+    for (auto &pReader : readers_) {
+      pReader->Unload();
+      delete pReader;
     }
+    readers_.clear();
   }
 
   static void resolveWatcherEvent(const etcd::Response &_resp,
@@ -215,25 +216,34 @@ private:
       cvCache_.notify_all();
   }
 
+  void set(std::string version, uint32_t genId, int start, int cnt) {
+    Version_ = version;
+    GenId_ = genId;
+    start_ = start;
+    cnt_ = cnt;
+    ready_ = false;
+
+    readers_.resize(cnt_);
+  }
+
+  void makeVisible() { ready_ = true; }
+
 public:
-  const std::string Version_;
-  uint32_t GenId_;
+  std::string Version_;
+  uint32_t GenId_ = 0;
 
   using SyncRecord = std::pair<std::atomic<int> *, etcd::Watcher *>;
 
-  SliceCache(std::string version, uint32_t genId, int start, int cnt)
-      : Version_(version), GenId_(genId), start_(start), cnt_(cnt) {}
+  SliceCache() = default;
 
-  static SliceCache *Get() {
-    std::shared_lock lk(mutP_);
-    return caches_.back();
-  }
-
+  /**
+  @param genId For local accesses, this should the maximum known GenId.
+  */
   static SliceCache *Get(uint32_t genId) {
-    std::shared_lock lk(mutP_);
-    return caches_.back()->GenId_ == genId    ? caches_.back()
-           : caches_.front()->GenId_ == genId ? caches_.front()
-                                              : nullptr;
+    auto ind = genId % 2;
+    if (!caches_[ind] || !caches_[ind]->ready_)
+      ind = !ind;
+    return caches_[ind];
   }
 
   /* must be called before DoSync */
@@ -253,51 +263,40 @@ public:
 
   static void DoSync(SyncRecord record, std::string version, uint32_t genId,
                      int start, int cnt) {
-    mutP_.lock_shared();
-    auto currentCacheSize = caches_.size();
-    mutP_.unlock_shared();
+    uint32_t ind = genId % 2;
+    if (!caches_[ind])
+      caches_[ind] = new SliceCache();
+    auto *pCache = caches_[ind];
 
-    if (currentCacheSize >= 2) {
-      mutP_.lock();
-      auto oldCache = caches_.front();
-      caches_.pop();
-      mutP_.unlock();
-
-      delete oldCache;
-    }
-
-    std::atomic<int> *syncCnt = record.first;
-    etcd::Watcher *pWatcher = record.second;
+    if (pCache->GenId_ != 0)
+      pCache->unload();
 
     std::cout << "SliceCache::DoSync" << std::endl;
-    // 1. Prepare the new version
-    auto newCache = new SliceCache(version, genId, start, cnt);
-    newCache->load();
-    // 2. Tell everyone else I'm ready to switch
+
+    std::cout << "1. Prepare the new version" << std::endl;
+    pCache->set(version, genId, start, cnt);
+    pCache->load();
+
+    std::cout << "2. Tell everyone else I'm ready to switch" << std::endl;
     EtcdService::RegisterVersion(version);
-    // 3. Wait for everyone else to get ready
+
+    std::cout << "3. Wait for everyone else to get ready" << std::endl;
+    std::atomic<int> *syncCnt = record.first;
+    etcd::Watcher *pWatcher = record.second;
     {
-      std::unique_lock lock(mutCv_);
+      std::mutex mut;
+      std::unique_lock lock(mut);
       cvCache_.wait(lock, [=] { return *syncCnt == gNodeNum; });
     }
 
     std::cout << "SliceCache::DoSync: everyone is ready" << std::endl;
-    {
-      std::unique_lock lock(mutP_);
-      caches_.push(newCache);
-    }
-
+    pCache->makeVisible();
     pWatcher->Cancel();
     delete pWatcher;
   }
 
   void Read(int slice, size_t seek, size_t len, RawBuffer buffer) {
     readers_[slice - start_]->Read(seek, len, buffer);
-  }
-
-  ~SliceCache() {
-    EtcdService::UnregisterVersion(Version_);
-    unload();
   }
 }; // class SliceCache
 
@@ -406,41 +405,18 @@ private:
 public:
   IntraServiceClient(std::shared_ptr<grpc::Channel> channel)
       : stub_(IntraService::NewStub(channel)) {
-    stop_ = false;
-    sendReqThread_ = std::thread(&IntraServiceClient::SendRequest, this);
     parseRespThread_ = std::thread(&IntraServiceClient::ParseResponse, this);
   }
 
-  ~IntraServiceClient() {
-    stop_ = true;
-    condition_.notify_all();
-    sendReqThread_.detach();
-    parseRespThread_.detach();
-  }
+  ~IntraServiceClient() { parseRespThread_.detach(); }
 
-  void EnqueueIntraReq(const IntraReq intraReq) {
-    std::unique_lock<std::mutex> lock(queueMutex_);
-    queue_.push(intraReq);
-    condition_.notify_one();
-  }
-
-  void SendRequest() {
-    while (!stop_) {
-      std::queue<IntraReq> tempQueue = {};
-      {
-        std::unique_lock<std::mutex> lock(queueMutex_);
-        condition_.wait(lock, [this] { return !queue_.empty(); });
-        std::swap(tempQueue, queue_);
-      }
-
-      while (!tempQueue.empty()) {
-        AsyncClientCall *call = new AsyncClientCall();
-        call->responseReader =
-            stub_->AsyncGet(&call->context, tempQueue.front(), &cq_);
-        tempQueue.pop();
-        call->responseReader->Finish(&call->reply, &call->status, (void *)call);
-      }
-    }
+  void SendIntraReq(const IntraReq &intraReq) {
+    AsyncClientCall *call = new AsyncClientCall();
+    call->responseReader =
+        stub_->PrepareAsyncGet(&call->context, intraReq, &cq_);
+    call->responseReader->StartCall();
+    call->responseReader->Finish(&call->reply, &call->status,
+                                 static_cast<void *>(call));
   }
 
   void ParseResponse() {
@@ -448,7 +424,7 @@ public:
     bool ok = false;
     IntraRespDataManager &respman = IntraRespDataManager::GetInstance();
 
-    while (!stop_) {
+    while (!gIsExiting) {
       cq_.Next(&tag, &ok);
       if (unlikely(!ok)) {
         std::cout << "cq_.Next failed" << std::endl;
@@ -457,7 +433,6 @@ public:
       AsyncClientCall *call = static_cast<AsyncClientCall *>(tag);
       auto &intraResp = call->reply;
 
-      // TODO: can we remove this copy?
       auto pMessage = respman.GetMessage(intraResp.id());
       if (!pMessage)
         std::cout << "pMessage is nullptr for " << intraResp.id() << std::endl;
@@ -475,15 +450,9 @@ public:
     }
   }
 
-  grpc::CompletionQueue cq_; // CompletionQueue is thread safe.
-
 private:
+  grpc::CompletionQueue cq_; // CompletionQueue is thread safe.
   std::unique_ptr<IntraService::Stub> stub_;
-  std::queue<IntraReq> queue_;
-  std::mutex queueMutex_;
-  std::condition_variable condition_;
-  bool stop_ = false;
-  std::thread sendReqThread_;
   std::thread parseRespThread_;
 }; // class IntraServiceClient
 
@@ -528,10 +497,6 @@ private:
       const auto &sliceReqs = request.slice_req();
       const auto genId = request.gen();
       auto pCache = SliceCache::Get(genId);
-      if (!pCache) {
-        std::cout << "[FATAL] pCache is nullptr for " << genId << std::endl;
-        return;
-      }
 
       const int N = sliceReqs.size();
       for (int i = 0; i < N; ++i) {
@@ -608,12 +573,19 @@ public:
   }
 }; // class IntraServiceImpl
 
-std::pair<int, int> GetSliceRange(int sliceCount, int nodeId) {
+std::pair<int, int> GetExactSliceRange(int sliceCount, int nodeId) {
   int avgSlice = sliceCount / gNodeNum;
   int quotient = sliceCount % gNodeNum;
   int start = avgSlice * nodeId + std::min(nodeId, quotient);
 
   return {start, start + avgSlice + (nodeId < quotient ? 1 : 0) - 1};
+}
+
+std::pair<int, int> GetOptimSliceRange(int sliceCount, int nodeId) {
+  int avgSlice = sliceCount / gNodeNum;
+  auto p = GetExactSliceRange(sliceCount, nodeId);
+  return {std::max(0, p.first - (avgSlice + 1) / 2),
+          std::min(sliceCount, p.second + (avgSlice + 1) / 2)};
 }
 
 class VersionSystem {
@@ -697,8 +669,8 @@ public:
         hdfsRead(fs, rbFile, buffer, versionBufferSize);
         hdfsCloseFile(fs, rbFile);
 
-        order = std::string(buffer).substr(6);
-        rtrim(order);
+        order = std::string(buffer).substr(
+            6, std::string("YYYY_MM_DD_HH_mm_SS").size());
         // std::cout << "rollback.version == " << order << std::endl;
         goto cleanup;
       } else if (filename.find("model_") == 0) {
@@ -762,7 +734,7 @@ public:
       VersionTracker::GetInstance().SetNSlices(targetVer, sliceCount);
     }
     std::cout << "  slice count = " << sliceCount << std::endl;
-    auto [start, end] = GetSliceRange(sliceCount, gNodeId);
+    auto [start, end] = GetOptimSliceRange(sliceCount, gNodeId);
 
     auto syncSchedule = SliceCache::ScheduleSync(targetVer);
     ++GenId_;
@@ -816,9 +788,9 @@ public:
           std::cout << "Registering public interface" << std::endl;
           EtcdService::RegisterModelService();
         }
-        CurrentVersion_ = newVersion;
+        CurrentVersion_ = std::move(newVersion);
       }
-      SleepMilli(3500);
+      SleepMilli(queryInterval);
     }
 
     hdfsDisconnect(fs);
@@ -837,7 +809,7 @@ private:
 
   int getServerIdFor(int slice, int nSlices) {
     for (int i = 0; i < gNodeNum; ++i) {
-      auto [start, end] = GetSliceRange(nSlices, i);
+      auto [start, end] = GetOptimSliceRange(nSlices, i);
       if (start <= slice && slice <= end)
         return i;
     }
@@ -853,8 +825,9 @@ private:
     uint64_t slice, seek, len;
     auto reqsForNode = new IntraReq[gNodeNum];
     const auto &sliceRequests = request->slice_request();
-    auto nSlices = VersionSystem::GetInstance()->GetNSlices();
-    auto pCache = SliceCache::Get();
+    auto pvs = VersionSystem::GetInstance();
+    auto nSlices = pvs->GetNSlices();
+    auto pCache = SliceCache::Get(pvs->GenId_);
 
     int nNodesComm = 0;
     for (int i = 0; i < sliceRequests.size(); ++i) {
@@ -871,8 +844,8 @@ private:
 
       serverNodeId = getServerIdFor(slice, nSlices);
       if (serverNodeId == gNodeId) {
-        // From what it appears on benchmarks, it looks like synchronous reading
-        // is enough right now
+        // From what it appears on benchmarks, it looks like synchronous
+        // reading is enough right now
         LocalRead(pCache, slice, seek, len, buffer);
       } else {
         auto &nodeReq = reqsForNode[serverNodeId];
@@ -894,7 +867,7 @@ private:
         if (reqsForNode[i].slice_req_size() > 0) {
           reqsForNode[i].set_id(respmanId);
           reqsForNode[i].set_gen(pCache->GenId_);
-          gIntraClients[i]->EnqueueIntraReq(reqsForNode[i]);
+          gIntraClients[i]->SendIntraReq(reqsForNode[i]);
         }
       }
 
@@ -935,9 +908,9 @@ int ParseIntEnv(const char *envName) {
 }
 
 /**
- * @brief Since we don't have a proper way to end this program, we need a way to
- * handle exits gracefully, so that `gprof` can generate the profiling data.
- * Excerpted from StackOverflow.
+ * @brief Since we don't have a proper way to end this program, we need a way
+ * to handle exits gracefully, so that `gprof` can generate the profiling
+ * data. Excerpted from StackOverflow.
  */
 void sigUsr1Handler(int sig) {
   std::cout << "Exiting on SIGUSR1" << std::endl;
