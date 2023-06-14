@@ -1,6 +1,6 @@
 echo "this is node $NODE_ID out of $NODE_NUM"
 echo "waiting for etcd server to fully start up"
-sleep 7
+sleep 5
 cd mamaserving && ./server
 # cd mamaserving && env LD_PRELOAD="/gperftools/build/lib/libtcmalloc.so" HEAPCHECK=normal  ./server
 
@@ -10,6 +10,6 @@ cd mamaserving && ./server
 # cd mamaserving && valgrind --leak-check=yes ./server
 
 echo 'Exited'
-while [[ 1 ]]; do
-    sleep 10000
-done
+# while [[ 1 ]]; do
+#     sleep 10000
+# done

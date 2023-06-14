@@ -2,7 +2,7 @@ HADDOP_VERSION = 3.3.1
 HADOOP_HOME = /opt/hadoop-$(HADOOP_VERSION)
 CPPFLAGS += `pkg-config --cflags protobuf grpc`
 CXXFLAGS += -std=c++17
-CXXFLAGS += -O2 #-pg
+CXXFLAGS += -Ofast -I./include #-pg
 CXX = g++
 
 #LDFLAGS += -pg
@@ -10,6 +10,7 @@ LDFLAGS += -L/usr/local/lib `pkg-config --libs protobuf grpc++` -pthread -Wl,--n
 LDFLAGS += -lpthread -letcd-cpp-api -lprotobuf -lgrpc++ -lgrpc -lz -lcpprest -lssl -lcrypto
 LDFLAGS += -lboost_system -lboost_filesystem -lmodel_slice_reader -lboost_log
 LDFLAGS += -I/usr/local/include/etcd/proto/ -I/usr/local/include/hdfs -L${HADOOP_HOME}/libhdfs -lhdfs
+LDFLAGS += -I./include
 
 PROTOC = protoc
 GRPC_CPP_PLUGIN = grpc_cpp_plugin
@@ -19,7 +20,7 @@ PROTOS_PATH = ./
 
 vpath %.proto $(PROTOS_PATH)
 
-server: alimama.pb.o alimama.grpc.pb.o ourmama.pb.o ourmama.grpc.pb.o server.o
+server: alimama.pb.o alimama.grpc.pb.o ourmama.pb.o ourmama.grpc.pb.o format.o server.o
 	$(CXX) $^ $(LDFLAGS) -o $@
 
 .PRECIOUS: %.grpc.pb.cc
