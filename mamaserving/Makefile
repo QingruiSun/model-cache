@@ -2,10 +2,9 @@ HADDOP_VERSION = 3.3.1
 HADOOP_HOME = /opt/hadoop-$(HADOOP_VERSION)
 CPPFLAGS += `pkg-config --cflags protobuf grpc`
 CXXFLAGS += -std=c++17
-CXXFLAGS += -Ofast -I./include -march=native #-pg
+CXXFLAGS += -Ofast -I./include
 CXX = g++
 
-#LDFLAGS += -pg
 LDFLAGS += -L/usr/local/lib `pkg-config --libs protobuf grpc++` -pthread -Wl,--no-as-needed -lgrpc++_reflection -Wl,--as-needed -ldl
 LDFLAGS += -lpthread -letcd-cpp-api -lprotobuf -lgrpc++ -lgrpc -lz -lcpprest -lssl -lcrypto
 LDFLAGS += -lboost_system -lboost_filesystem -lmodel_slice_reader -lboost_log
