@@ -9,6 +9,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
+#include <ctime>
 #include <deque>
 #include <dlfcn.h>
 #include <etcd/Client.hpp>
@@ -30,6 +31,12 @@
 #include <unistd.h>
 #include <unordered_map>
 
+#define BOOST_LOG_DYN_LINK 1
+#include <boost/log/core.hpp>
+#include <boost/log/expressions.hpp>
+#include <boost/log/trivial.hpp>
+namespace logging = boost::log;
+
 using MamaRequest = alimama::proto::Request;
 using MamaResponse = alimama::proto::Response;
 using SliceRequest = alimama::proto::SliceRequest;
@@ -37,7 +44,9 @@ using alimama::proto::ModelService;
 
 using IntraReq = ourmama::proto::IntraReq;
 using IntraResp = ourmama::proto::IntraResp;
+using google::protobuf::Empty;
 using ourmama::proto::IntraService;
+using ourmama::proto::PingService;
 
 using grpc::ServerContext;
 using grpc::Status;
@@ -49,8 +58,10 @@ using RawBuffer = char *;
 
 constexpr size_t KB = 1024;
 constexpr size_t MB = 1024 * KB;
+constexpr size_t GB = 1024 * MB;
 
 constexpr int queryInterval = 2500; // milliseconds
+constexpr int pingPort = 50049;
 constexpr int intraPort = 50050;
 
 const std::string etcdUrl = "http://etcd:2379";
@@ -62,6 +73,7 @@ const std::string etcdVersionSyncNodeFmt = "/version-%1%/%2%";
 bool gIsExiting = false;
 int gNodeId;
 int gNodeNum;
+int gSliceCount, gAvgSlice, gQuotient;
 std::string gNodeIp;
 std::vector<std::string> gNodeIps;
 
@@ -70,6 +82,18 @@ std::vector<std::string> gNodeIps;
 void SleepMilli(int ms) {
   std::this_thread::sleep_for(std::chrono::milliseconds(ms));
 }
+
+#ifdef LOWQPS
+std::atomic<int> tokenId;
+std::atomic<int> grantId;
+void RateLimiter() {
+  while (!gIsExiting) {
+    if (tokenId <= grantId + 20)
+      ++tokenId;
+    std::this_thread::sleep_for(std::chrono::microseconds(2000));
+  }
+}
+#endif
 
 // trim from end
 static inline std::string rtrim(std::string s) {
@@ -84,11 +108,11 @@ namespace EtcdService {
 #define LAUNCH_ETCD_TASK(keyStr, opStr)                                        \
   try {                                                                        \
     etcd::Response response = task.get();                                      \
-    std::cout << "[etcd] " << opStr << " " << (keyStr)                         \
-              << (response.is_ok() ? " succeeds" : " failed") << std::endl;    \
+    BOOST_LOG_TRIVIAL(info) << "[etcd] " << opStr << " " << (keyStr)           \
+                            << (response.is_ok() ? " succeeds" : " failed");   \
   } catch (const std::exception &e) {                                          \
-    std::cout << "[etcd] An exception occurred during " << opStr << " "        \
-              << (keyStr) << std::endl;                                        \
+    BOOST_LOG_TRIVIAL(error)                                                   \
+        << "[etcd] An exception occurred during " << opStr << " " << (keyStr); \
   }
 
 void set(std::string key, std::string value) {
@@ -114,15 +138,16 @@ void RegisterIntra() {
               .set(FMT(etcdIntraDiscoveryFmt, gNodeIp), std::getenv("NODE_ID"))
               .get();
       if (response.is_ok()) {
-        std::cout << "RegisterIntra success" << std::endl;
+        BOOST_LOG_TRIVIAL(info) << "RegisterIntra success";
         return;
       } else {
-        std::cout << "RegisterIntra: failed; reason: "
-                  << response.error_message() << "; retrying..." << std::endl;
+        BOOST_LOG_TRIVIAL(warning)
+            << "RegisterIntra: failed; reason: " << response.error_message()
+            << "; retrying...";
         SleepMilli(queryInterval);
       }
     } catch (const std::exception &e) {
-      std::cout << "RegisterIntra: exception: " << e.what() << std::endl;
+      BOOST_LOG_TRIVIAL(error) << "RegisterIntra: exception: " << e.what();
       SleepMilli(queryInterval);
     }
   }
@@ -137,8 +162,9 @@ void GetAllNodesIp() {
       auto response = client.ls("/intra/").get();
       if (response.is_ok()) {
         if (response.keys().size() != gNodeNum) {
-          std::cout << "GetAllNodesIp: only " << response.keys().size()
-                    << " nodes are discovered, retrying..." << std::endl;
+          BOOST_LOG_TRIVIAL(info)
+              << "GetAllNodesIp: only " << response.keys().size()
+              << " nodes are discovered, retrying...";
           SleepMilli(queryInterval);
           continue;
         }
@@ -152,47 +178,55 @@ void GetAllNodesIp() {
         return;
 
       } else {
-        std::cout << "GetAllNodesIp failed: " << response.error_code() << " "
-                  << response.error_message() << std::endl;
+        BOOST_LOG_TRIVIAL(warning)
+            << "GetAllNodesIp failed: " << response.error_code() << " "
+            << response.error_message();
         SleepMilli(queryInterval);
       }
     } catch (const std::exception &e) {
-      std::cout << "An exception occurred during GetAllNodesIp: " << e.what()
-                << std::endl;
+      BOOST_LOG_TRIVIAL(error)
+          << "An exception occurred during GetAllNodesIp: " << e.what();
       return;
     }
   }
 }
 
 static void RegisterModelService() {
-  set(FMT(etcdServiceDiscoveryFmt, gNodeIp), "");
+  static boost::format fmter("/services/modelservice/node-%1%:50051");
+
+  for (int i = 1; i <= gNodeNum; ++i)
+    set(boost::str(boost::format(fmter) % i), "");
 }
 
-static void RegisterVersion(std::string modelVersion) {
-  set(FMT(etcdVersionSyncNodeFmt, modelVersion % gNodeId), "");
+static void RegisterVersion(int gen) {
+  set(FMT(etcdVersionSyncNodeFmt, gen % gNodeId), "");
 }
 
-static void UnregisterVersion(std::string modelVersion) {
-  rm(FMT(etcdVersionSyncNodeFmt, modelVersion % gNodeId));
+static void UnregisterVersion(int gen) {
+  rm(FMT(etcdVersionSyncNodeFmt, gen % gNodeId));
 }
 } // namespace EtcdService
+
+std::atomic<int> syncCnt = 0;
+etcd::Watcher *pWatcher = nullptr;
 
 class SliceCache {
 private:
   std::string targetPath(int slice) {
-    static boost::format fmter("./model_%1%/model_slice.%2$03d");
-    return boost::str(boost::format(fmter) % Version_ % slice);
+    return FMT("./model_%1%/model_slice.%2$03d", Version_ % slice);
   }
 
   int start_;
-  int cnt_ = 0;
-  bool ready_ = false;
+  int cnt_;
   std::vector<ModelSliceReader *> readers_;
 
-  inline static SliceCache *(caches_[2]);
+  inline static std::queue<std::shared_ptr<SliceCache>> caches_;
+  inline static std::mutex mutCv_;
+  inline static std::shared_mutex mutP_;
   inline static std::condition_variable cvCache_;
 
   void load() {
+    readers_.resize(cnt_);
     for (int i = 0; i < cnt_; i++) {
       // TODO: what if a version switch happens during load
       readers_[i] = new ModelSliceReader();
@@ -201,102 +235,90 @@ private:
   }
 
   void unload() {
-    EtcdService::UnregisterVersion(Version_);
-    for (auto &pReader : readers_) {
-      pReader->Unload();
-      delete pReader;
+    for (auto reader : readers_) {
+      reader->Unload();
+      delete reader;
     }
-    readers_.clear();
   }
 
-  static void resolveWatcherEvent(const etcd::Response &_resp,
-                                  std::atomic<int> &syncCnt) {
-    std::cout << "Watcher: current synccnt: " << syncCnt << std::endl;
-    if ((++syncCnt) == gNodeNum)
+public:
+  const std::string Version_;
+  uint32_t GenId_;
+
+  static void WatcherCb(const etcd::Response &_resp) {
+    BOOST_LOG_TRIVIAL(info) << "Watcher: current synccnt: " << ++syncCnt;
+    if (syncCnt == gNodeNum)
       cvCache_.notify_all();
   }
 
-  void set(std::string version, uint32_t genId, int start, int cnt) {
-    Version_ = version;
-    GenId_ = genId;
-    start_ = start;
-    cnt_ = cnt;
-    ready_ = false;
+  /* must be called before Load */
+  static void ScheduleSync(int gen) {
+    static boost::format fmter(etcdVersionSyncNodeFmt);
 
-    readers_.resize(cnt_);
+    auto start = boost::str(boost::format(fmter) % gen % 0);
+    auto end = boost::str(boost::format(fmter) % gen % gNodeNum);
+    pWatcher = new etcd::Watcher(
+        etcdUrl, start, end,
+        [&](const etcd::Response &_resp) { WatcherCb(_resp); });
   }
 
-  void makeVisible() { ready_ = true; }
+  SliceCache(std::string version, uint32_t genId, int start, int cnt)
+      : Version_(version), GenId_(genId), start_(start), cnt_(cnt) {}
 
-public:
-  std::string Version_;
-  uint32_t GenId_ = 0;
-
-  using SyncRecord = std::pair<std::atomic<int> *, etcd::Watcher *>;
-
-  SliceCache() = default;
-
-  /**
-  @param genId For local accesses, this should the maximum known GenId.
-  */
-  static SliceCache *Get(uint32_t genId) {
-    auto ind = genId % 2;
-    if (!caches_[ind] || !caches_[ind]->ready_)
-      ind = !ind;
-    return caches_[ind];
+  static std::shared_ptr<SliceCache> Get() {
+    std::shared_lock lk(mutP_);
+    return caches_.back();
   }
 
-  /* must be called before DoSync */
-  static SyncRecord ScheduleSync(std::string version) {
-    static std::atomic<int> syncCnt;
-
-    syncCnt = 0;
-    auto start =
-        boost::str(boost::format(etcdVersionSyncNodeFmt) % version % 0);
-    auto end =
-        boost::str(boost::format(etcdVersionSyncNodeFmt) % version % gNodeNum);
-    return {&syncCnt, new etcd::Watcher(etcdUrl, start, end,
-                                        [&](const etcd::Response &_resp) {
-                                          resolveWatcherEvent(_resp, syncCnt);
-                                        })};
+  static std::shared_ptr<SliceCache> Get(uint32_t genId) {
+    std::shared_lock lk(mutP_);
+    return caches_.back()->GenId_ == genId    ? caches_.back()
+           : caches_.front()->GenId_ == genId ? caches_.front()
+                                              : nullptr;
   }
 
-  static void DoSync(SyncRecord record, std::string version, uint32_t genId,
-                     int start, int cnt) {
-    uint32_t ind = genId % 2;
-    if (!caches_[ind])
-      caches_[ind] = new SliceCache();
-    auto *pCache = caches_[ind];
+  static std::shared_ptr<SliceCache> Load(std::string version, uint32_t genId,
+                                          int start, int cnt) {
+    BOOST_LOG_TRIVIAL(info) << "SliceCache::Load";
 
-    if (pCache->GenId_ != 0)
-      pCache->unload();
+    BOOST_LOG_TRIVIAL(info) << "1. Prepare the new version";
+    std::shared_ptr<SliceCache> newCache =
+        std::make_shared<SliceCache>(version, genId, start, cnt);
+    newCache->load();
 
-    std::cout << "SliceCache::DoSync" << std::endl;
+    return newCache;
+  }
 
-    std::cout << "1. Prepare the new version" << std::endl;
-    pCache->set(version, genId, start, cnt);
-    pCache->load();
+  static void MakeVisible(std::shared_ptr<SliceCache> newCache) {
+    BOOST_LOG_TRIVIAL(info) << "2. Tell everyone else I'm ready to switch";
+    EtcdService::RegisterVersion(newCache->GenId_);
 
-    std::cout << "2. Tell everyone else I'm ready to switch" << std::endl;
-    EtcdService::RegisterVersion(version);
-
-    std::cout << "3. Wait for everyone else to get ready" << std::endl;
-    std::atomic<int> *syncCnt = record.first;
-    etcd::Watcher *pWatcher = record.second;
+    BOOST_LOG_TRIVIAL(info) << "3. Wait for everyone else to be ready";
     {
-      std::mutex mut;
-      std::unique_lock lock(mut);
-      cvCache_.wait(lock, [=] { return *syncCnt == gNodeNum; });
+      std::unique_lock lock(mutCv_);
+      cvCache_.wait(lock, [=] { return syncCnt == gNodeNum; });
+      syncCnt = 0;
     }
 
-    std::cout << "SliceCache::DoSync: everyone is ready" << std::endl;
-    pCache->makeVisible();
-    pWatcher->Cancel();
+    BOOST_LOG_TRIVIAL(info) << "SliceCache::Load: everyone is ready";
     delete pWatcher;
+    ScheduleSync(newCache->GenId_ + 1);
+
+    {
+      std::unique_lock lock(mutP_);
+      if (caches_.size() == 2)
+        caches_.pop();
+      caches_.push(newCache);
+    }
   }
 
   void Read(int slice, size_t seek, size_t len, RawBuffer buffer) {
     readers_[slice - start_]->Read(seek, len, buffer);
+  }
+
+  ~SliceCache() {
+    EtcdService::UnregisterVersion(GenId_);
+    unload();
   }
 }; // class SliceCache
 
@@ -393,6 +415,55 @@ public:
   }
 }; // class IntraRespDataManager
 
+class PingServiceClient final {
+public:
+  PingServiceClient(std::shared_ptr<grpc::Channel> channel)
+      : stub_(PingService::NewStub(channel)) {}
+
+  void Ping() {
+    static auto _empty = Empty();
+
+    grpc::ClientContext context;
+    Empty _pemp;
+    Status status = stub_->Ping(&context, _empty, &_pemp);
+    if (!status.ok())
+      BOOST_LOG_TRIVIAL(error)
+          << "PingServiceClient::Ping: " << status.error_message();
+    else
+      BOOST_LOG_TRIVIAL(info) << "PingServiceClient::Ping: OK";
+  }
+
+private:
+  std::unique_ptr<PingService::Stub> stub_;
+}; // class PingServiceClient
+
+PingServiceClient *pPingClient = nullptr;
+
+std::condition_variable gCvPing;
+bool gPinged = false;
+
+class PingServiceImpl final : public PingService::Service {
+public:
+  Status Ping(grpc::ServerContext *context, const Empty *_noreq,
+              Empty *_norep) override {
+    gPinged = true;
+    gCvPing.notify_one();
+    return Status::OK;
+  }
+
+  void Run() {
+    const auto addr = std::string("0.0.0.0:") + std::to_string(pingPort);
+
+    grpc::ServerBuilder grpcServerBuilder;
+    grpcServerBuilder.AddListeningPort(addr, grpc::InsecureServerCredentials());
+    grpcServerBuilder.RegisterService(this);
+    std::unique_ptr<grpc::Server> server(grpcServerBuilder.BuildAndStart());
+    BOOST_LOG_TRIVIAL(info) << "Server listening on " << addr;
+
+    server->Wait();
+  }
+}; // class PingServiceImpl
+
 class IntraServiceClient final {
 private:
   struct AsyncClientCall {
@@ -427,15 +498,17 @@ public:
     while (!gIsExiting) {
       cq_.Next(&tag, &ok);
       if (unlikely(!ok)) {
-        std::cout << "cq_.Next failed" << std::endl;
+        BOOST_LOG_TRIVIAL(error) << "cq_.Next failed";
         continue;
       }
       AsyncClientCall *call = static_cast<AsyncClientCall *>(tag);
       auto &intraResp = call->reply;
 
       auto pMessage = respman.GetMessage(intraResp.id());
-      if (!pMessage)
-        std::cout << "pMessage is nullptr for " << intraResp.id() << std::endl;
+      if (unlikely(!pMessage))
+        BOOST_LOG_TRIVIAL(error)
+            << "pMessage is nullptr for " << intraResp.id();
+
       const int N = intraResp.data().size();
       for (int i = 0; i < N; ++i) {
         const auto &slice = intraResp.data(i);
@@ -470,8 +543,8 @@ void EstablishIntraConn() {
   }
 }
 
-void LocalRead(SliceCache *pSc, uint64_t slice, uint64_t seek, uint64_t len,
-               RawBuffer buffer) {
+void LocalRead(std::shared_ptr<SliceCache> pSc, uint64_t slice, uint64_t seek,
+               uint64_t len, RawBuffer buffer) {
   pSc->Read(slice, seek, len, buffer);
 }
 
@@ -496,7 +569,14 @@ private:
       uint64_t slice, seek, len;
       const auto &sliceReqs = request.slice_req();
       const auto genId = request.gen();
-      auto pCache = SliceCache::Get(genId);
+      std::shared_ptr<SliceCache> pCache = nullptr;
+      while (true) {
+        pCache = SliceCache::Get(genId);
+        if (pCache)
+          break;
+        BOOST_LOG_TRIVIAL(error) << "pCache is nullptr for " << genId;
+        std::this_thread::sleep_for(std::chrono::nanoseconds(500));
+      }
 
       const int N = sliceReqs.size();
       for (int i = 0; i < N; ++i) {
@@ -541,10 +621,14 @@ private:
 public:
   void HandleRPCs() {
     new CallData(&service_, cq_.get());
-    void *tag;
+    void *tag = nullptr;
     bool ok;
-    while (true) {
+    while (!gIsExiting) {
       cq_->Next(&tag, &ok);
+      if (unlikely(!ok || !tag)) {
+        BOOST_LOG_TRIVIAL(error) << "HandleRPCS: cq_->Next failed";
+        continue;
+      }
       static_cast<CallData *>(tag)->Proceed();
     }
   }
@@ -557,14 +641,14 @@ public:
   }
 
   void Run(uint16_t port) {
-    std::string server_address = std::string("0.0.0.0:") + std::to_string(port);
+    std::string addr = std::string("0.0.0.0:") + std::to_string(port);
 
     grpc::ServerBuilder builder;
-    builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());
+    builder.AddListeningPort(addr, grpc::InsecureServerCredentials());
     builder.RegisterService(&service_);
     cq_ = builder.AddCompletionQueue();
     server_ = builder.BuildAndStart();
-    std::cout << "Server listening on " << server_address << std::endl;
+    BOOST_LOG_TRIVIAL(info) << "Server listening on " << addr;
 
     // constexpr int nThreads = 6;
     constexpr int nThreads = 1;
@@ -573,37 +657,23 @@ public:
   }
 }; // class IntraServiceImpl
 
-std::pair<int, int> GetExactSliceRange(int sliceCount, int nodeId) {
-  int avgSlice = sliceCount / gNodeNum;
-  int quotient = sliceCount % gNodeNum;
-  int start = avgSlice * nodeId + std::min(nodeId, quotient);
-
-  return {start, start + avgSlice + (nodeId < quotient ? 1 : 0) - 1};
-}
-
-std::pair<int, int> GetOptimSliceRange(int sliceCount, int nodeId) {
-  int avgSlice = sliceCount / gNodeNum;
-  auto p = GetExactSliceRange(sliceCount, nodeId);
-  return {std::max(0, p.first - (avgSlice + 1) / 2),
-          std::min(sliceCount, p.second + (avgSlice + 1) / 2)};
+std::pair<int, int> GetSliceRange(int nodeId) {
+  int start = gAvgSlice * nodeId + std::min(nodeId, gQuotient);
+  return {start, start + gAvgSlice + (nodeId < gQuotient ? 1 : 0) - 1};
 }
 
 class VersionSystem {
 private:
   class VersionTracker {
-    std::unordered_map<std::string, std::pair<bool, size_t>> record_;
+    std::unordered_set<std::string> record_;
     VersionTracker() = default;
 
   public:
-    size_t GetNSlices(std::string version) { return record_[version].second; }
-
-    void SetNSlices(std::string version, size_t nSlices) {
-      record_[version].second = nSlices;
+    bool IsDownloaded(std::string version) {
+      return record_.count(version) > 0;
     }
 
-    bool IsDownloaded(std::string version) { return record_[version].first; }
-
-    void SetDownloaded(std::string version) { record_[version].first = true; }
+    void SetDownloaded(std::string version) { record_.insert(version); }
 
     static VersionTracker &GetInstance() {
       static VersionTracker instance;
@@ -612,24 +682,27 @@ private:
   }; // class VersionTracker
 
   int getVersionSliceCountFromHdfs(hdfsFS &fs, std::string modelVersion) {
+    static boost::format fmter("/model_%1%/");
     int numEntries = 0;
-    std::string path = FMT("/model_%1%/", modelVersion);
+    std::string path = boost::str(boost::format(fmter) % modelVersion);
 
     hdfsFileInfo *fileInfo = hdfsListDirectory(fs, path.c_str(), &numEntries);
     if (likely(fileInfo != nullptr && numEntries > 0)) {
       hdfsFreeFileInfo(fileInfo, numEntries);
       return numEntries - 2;
     } else {
-      std::cout << "  hdfs: list directory " << path << " failed" << std::endl;
+      BOOST_LOG_TRIVIAL(info) << "  hdfs: list directory " << path << " failed";
       return 0;
     }
   }
 
   // Assuming the version pointed by pSliceCaches.back() is the latest
-  void loadToMem(SliceCache::SyncRecord syncRecord, std::string version,
-                 uint32_t genId, int start, int cnt) {
-    std::cout << "  Preparing new cache" << std::endl;
-    SliceCache::DoSync(syncRecord, version, genId, start, cnt);
+  void loadToMem(std::string version, uint32_t genId, int start, int cnt) {
+    BOOST_LOG_TRIVIAL(info) << "  Preparing new cache";
+    auto newCache = SliceCache::Load(version, genId, start, cnt);
+    BOOST_LOG_TRIVIAL(info) << "  Pinging next in line";
+    pPingClient->Ping();
+    SliceCache::MakeVisible(newCache);
   }
 
   VersionSystem() = default;
@@ -644,7 +717,7 @@ public:
   }
 
   std::vector<std::string> LatestVersionOn(hdfsFS &fs) {
-    constexpr size_t versionBufferSize = 1024;
+    constexpr size_t versionBufferSize = 128;
 
     int numEntries;
     std::string order;
@@ -653,7 +726,7 @@ public:
     hdfsFileInfo *fileInfo = hdfsListDirectory(fs, "/", &numEntries);
     if (unlikely(fileInfo == nullptr || numEntries == 0)) {
       order = "WAIT";
-      std::cout << "[WARN] no version found" << std::endl;
+      BOOST_LOG_TRIVIAL(warning) << "no version found";
       goto cleanup;
     }
 
@@ -671,7 +744,8 @@ public:
 
         order = std::string(buffer).substr(
             6, std::string("YYYY_MM_DD_HH_mm_SS").size());
-        // std::cout << "rollback.version == " << order << std::endl;
+        // BOOST_LOG_TRIVIAL(info)  << "rollback.version == " << order <<
+        // std::endl;
         goto cleanup;
       } else if (filename.find("model_") == 0) {
         // Starting with model_ means it could be valid version.
@@ -704,15 +778,15 @@ public:
         "./model_%1%/model_slice.%2$03d");
 
     std::string command = FMT("mkdir -p ./model_%1%", version);
-    std::cout << "  dispatching command: " << command << std::endl;
+    BOOST_LOG_TRIVIAL(info) << "  dispatching: " << command;
     system(command.c_str());
 
-    std::cout << "  Downloading version " << version << std::endl;
-    std::cout << "  planned download: [" << start << ", " << end << "]"
-              << std::endl;
+    BOOST_LOG_TRIVIAL(info) << "  Downloading version " << version;
+    BOOST_LOG_TRIVIAL(info)
+        << "  planned download: [" << start << ", " << end << "]";
     for (int i = start; i <= end; ++i) {
       command = boost::str(boost::format(fmter) % version % i);
-      std::cout << "  dispatching command: " << command << std::endl;
+      BOOST_LOG_TRIVIAL(info) << "  dispatching: " << command;
       system(command.c_str());
     }
 
@@ -728,92 +802,99 @@ public:
                                         bool shouldPreload = false) {
     auto versionTracker = VersionTracker::GetInstance();
     auto targetVer = versions[0];
-    auto sliceCount = versionTracker.GetNSlices(targetVer);
-    if (!sliceCount) {
-      sliceCount = getVersionSliceCountFromHdfs(fs, targetVer);
-      VersionTracker::GetInstance().SetNSlices(targetVer, sliceCount);
+    if (!gSliceCount) {
+      gSliceCount = getVersionSliceCountFromHdfs(fs, targetVer);
+      gAvgSlice = gSliceCount / gNodeNum;
+      gQuotient = gSliceCount % gNodeNum;
     }
-    std::cout << "  slice count = " << sliceCount << std::endl;
-    auto [start, end] = GetOptimSliceRange(sliceCount, gNodeId);
+    BOOST_LOG_TRIVIAL(info) << "  slice count = " << gSliceCount;
+    auto [start, end] = GetSliceRange(gNodeId);
 
-    auto syncSchedule = SliceCache::ScheduleSync(targetVer);
     ++GenId_;
 
     /// 1. check if the version is already downloaded to local disk
-    std::cout << "[1] checking if version " << targetVer << " is on disk"
-              << std::endl;
+    BOOST_LOG_TRIVIAL(info)
+        << "[1] checking if version " << targetVer << " is on disk";
     if (versionTracker.IsDownloaded(targetVer)) {
-      std::cout << "  Loading into mem" << std::endl;
-      loadToMem(syncSchedule, targetVer, GenId_, start, end - start + 1);
-      return;
+      goto ret;
     }
 
     /// 2. the normal slow path
-    std::cout << "[2] downloading versions[0] " << targetVer << " from hdfs"
-              << std::endl;
+    BOOST_LOG_TRIVIAL(info)
+        << "[2] downloading version " << targetVer << " from hdfs";
     downloadVersionFrom(fs, targetVer, start, end);
 
     if (shouldPreload) {
-      std::cout << "[3] attempting to preload other versions" << std::endl;
+      BOOST_LOG_TRIVIAL(info) << "[3] attempting to preload other versions";
       for (int i = 1; i < versions.size(); ++i) {
-        std::cout << "  Preloading versions[" << i << "]: " << versions[i]
-                  << std::endl;
+        BOOST_LOG_TRIVIAL(info)
+            << "  Preloading versions[" << i << "]: " << versions[i];
         downloadVersionFrom(fs, versions[i], start, end);
-        std::cout << "  >> Preloading version " << versions[i] << " done"
-                  << std::endl;
+        BOOST_LOG_TRIVIAL(info)
+            << "  >> Preloading version " << versions[i] << " done";
       }
     }
 
-    std::cout << "  Loading into mem" << std::endl;
-    loadToMem(syncSchedule, targetVer, GenId_, start, end - start + 1);
+  ret:
+    BOOST_LOG_TRIVIAL(info) << "  Loading into mem";
+    loadToMem(targetVer, GenId_, start, end - start + 1);
   }
 
   void Run() {
+#define WAIT_PING()                                                            \
+  {                                                                            \
+    std::mutex mut;                                                            \
+    std::unique_lock lk(mut);                                                  \
+    gCvPing.wait(lk, [] { return gPinged; });                                  \
+  }
+
     hdfsFS fs = hdfsConnect("hdfs://namenode", 9000);
 
     while (!gIsExiting) {
+      if (gNodeId != 0)
+        WAIT_PING();
+
       auto versions = LatestVersionOn(fs);
       auto newVersion = versions[0];
       if (newVersion != "WAIT" && CurrentVersion_ != newVersion) {
-        std::cout << "Current version: " << CurrentVersion_
-                  << ", new version: " << newVersion << std::endl;
-        std::cout << "Getting version " << newVersion << std::endl;
+        BOOST_LOG_TRIVIAL(info) << "Current version: " << CurrentVersion_
+                                << ", new version: " << newVersion;
 
         bool isFirstLoad = CurrentVersion_ == "WAIT";
+
         // We have the choice to download all the versions beforehand. As it
         // appears, it's not against the rules
         DownloadVersionAndOptionallyLoad(fs, versions, isFirstLoad);
+        CurrentVersion_ = newVersion;
+
         if (isFirstLoad) {
           // We're required to register this service onto Etcd
-          std::cout << "Registering public interface" << std::endl;
+          BOOST_LOG_TRIVIAL(info) << "Registering public interface";
           EtcdService::RegisterModelService();
         }
-        CurrentVersion_ = std::move(newVersion);
       }
-      SleepMilli(queryInterval);
+
+      gPinged = false;
+
+      if (gNodeId == 0)
+        SleepMilli(3000);
     }
 
     hdfsDisconnect(fs);
-  }
 
-  size_t GetNSlices(std::string version) {
-    return VersionTracker::GetInstance().GetNSlices(version);
+#undef WAIT_PING
   }
-
-  size_t GetNSlices() { return GetNSlices(CurrentVersion_); }
 }; // class VersionSystem
 
 class ModelServiceImpl final : public ModelService::Service {
 private:
-  using LocalReadTask = std::tuple<uint64_t, uint64_t, uint64_t, RawBuffer>;
-
-  int getServerIdFor(int slice, int nSlices) {
+  int getServerIdFor(int slice) {
     for (int i = 0; i < gNodeNum; ++i) {
-      auto [start, end] = GetOptimSliceRange(nSlices, i);
+      auto [start, end] = GetSliceRange(i);
       if (start <= slice && slice <= end)
         return i;
     }
-    std::cout << "ERROR: getServerIdFor(" << slice << ") failed" << std::endl;
+    BOOST_LOG_TRIVIAL(error) << "getServerIdFor(" << slice << ") failed";
     return 0;
   }
 
@@ -826,8 +907,7 @@ private:
     auto reqsForNode = new IntraReq[gNodeNum];
     const auto &sliceRequests = request->slice_request();
     auto pvs = VersionSystem::GetInstance();
-    auto nSlices = pvs->GetNSlices();
-    auto pCache = SliceCache::Get(pvs->GenId_);
+    auto pCache = SliceCache::Get();
 
     int nNodesComm = 0;
     for (int i = 0; i < sliceRequests.size(); ++i) {
@@ -842,10 +922,10 @@ private:
       pMessage->resize(len);
       RawBuffer buffer = pMessage->data();
 
-      serverNodeId = getServerIdFor(slice, nSlices);
+      serverNodeId = getServerIdFor(slice);
       if (serverNodeId == gNodeId) {
-        // From what it appears on benchmarks, it looks like synchronous
-        // reading is enough right now
+        // From what it appears on benchmarks, it looks like synchronous reading
+        // is enough right now
         LocalRead(pCache, slice, seek, len, buffer);
       } else {
         auto &nodeReq = reqsForNode[serverNodeId];
@@ -882,6 +962,12 @@ private:
 public:
   Status Get(ServerContext *context, const MamaRequest *request,
              MamaResponse *reply) override {
+#ifdef LOWQPS
+    int localGrantId = grantId++;
+    while (localGrantId > tokenId) {
+      /* loop indefinitely */
+    }
+#endif
     progress(request, reply);
     return Status::OK;
   }
@@ -896,7 +982,7 @@ static void RunPublicGrpc() {
                                      grpc::InsecureServerCredentials());
   grpcServerBuilder.RegisterService(&service);
   std::unique_ptr<grpc::Server> server(grpcServerBuilder.BuildAndStart());
-  std::cout << "Server listening on " << serverAddr << std::endl;
+  BOOST_LOG_TRIVIAL(info) << "Server listening on " << serverAddr;
 
   server->Wait();
   gIsExiting = true;
@@ -908,16 +994,16 @@ int ParseIntEnv(const char *envName) {
 }
 
 /**
- * @brief Since we don't have a proper way to end this program, we need a way
- * to handle exits gracefully, so that `gprof` can generate the profiling
- * data. Excerpted from StackOverflow.
+ * @brief Since we don't have a proper way to end this program, we need a way to
+ * handle exits gracefully, so that `gprof` can generate the profiling data.
+ * Excerpted from StackOverflow.
  */
 void sigUsr1Handler(int sig) {
-  std::cout << "Exiting on SIGUSR1" << std::endl;
+  BOOST_LOG_TRIVIAL(info) << "Exiting on SIGUSR1";
   void (*_mcleanup)(void);
   _mcleanup = (void (*)(void))dlsym(RTLD_DEFAULT, "_mcleanup");
   if (_mcleanup == NULL)
-    std::cout << "Unable to find gprof exit hook" << std::endl;
+    BOOST_LOG_TRIVIAL(info) << "Unable to find gprof exit hook";
   else
     _mcleanup();
   _exit(0);
@@ -925,6 +1011,8 @@ void sigUsr1Handler(int sig) {
 
 int main(int argc, char **argv) {
   signal(SIGUSR1, sigUsr1Handler);
+  logging::core::get()->set_filter(logging::trivial::severity >=
+                                   logging::trivial::info);
 
   gNodeId = ParseIntEnv("NODE_ID") - 1;
   gNodeNum = ParseIntEnv("NODE_NUM");
@@ -937,11 +1025,27 @@ int main(int argc, char **argv) {
   EstablishIntraConn();
 
   std::vector<std::thread> threads;
+  PingServiceImpl pingServer;
+  threads.emplace_back(&PingServiceImpl::Run, &pingServer);
+
+  int nextInRing = gNodeId + 2;
+  nextInRing = nextInRing > gNodeNum ? 1 : nextInRing;
+  pPingClient = new PingServiceClient(
+      grpc::CreateChannel(FMT("node-%1%:%2%", nextInRing % pingPort),
+                          grpc::InsecureChannelCredentials()));
+  SliceCache::ScheduleSync(1);
+
   threads.emplace_back(&VersionSystem::Run, VersionSystem::GetInstance());
   threads.emplace_back(&RunPublicGrpc);
 
+#ifdef LOWQPS
+  threads.emplace_back(&RateLimiter);
+#endif
+
   for (auto &thread : threads)
     thread.join();
+
+  delete pPingClient;
 
   return 0;
 }

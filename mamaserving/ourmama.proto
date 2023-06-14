@@ -1,6 +1,7 @@
 syntax = "proto3";
 
 import "alimama.proto";
+import "google/protobuf/empty.proto";
 
 package ourmama.proto;
 
@@ -18,5 +19,9 @@ message IntraResp {
 }
 
 service IntraService {
-    rpc Get(IntraReq) returns (IntraResp) {}
+    rpc Get(IntraReq) returns (IntraResp);
+}
+
+service PingService {
+    rpc Ping(google.protobuf.Empty) returns (google.protobuf.Empty);
 }

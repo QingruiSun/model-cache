@@ -10,6 +10,6 @@ cd mamaserving && ./server
 # cd mamaserving && valgrind --leak-check=yes ./server
 
 echo 'Exited'
-# while [[ 1 ]]; do
-#     sleep 10000
-# done
+while [[ 1 ]]; do
+    sleep 10000
+done
