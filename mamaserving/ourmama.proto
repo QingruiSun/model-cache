@@ -6,15 +6,15 @@ import "google/protobuf/empty.proto";
 package ourmama.proto;
 
 message IntraReq {
-    uint64 id = 1; // session id
+    uint32 id = 1; // session id
     uint32 gen = 2; // version generation id
-    repeated uint64 offset = 3; // which task in the session
+    repeated uint32 offset = 3; // which task in the session
     repeated alimama.proto.SliceRequest slice_req = 4;
 }
 
 message IntraResp {
-    uint64 id = 1;
-    repeated uint64 offset = 2;
+    uint32 id = 1;
+    repeated uint32 offset = 2;
     repeated bytes data = 3;
 }
 

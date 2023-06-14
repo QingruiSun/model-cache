@@ -3,14 +3,9 @@
 #include "alimama.pb.h"
 #include "ourmama.grpc.pb.h"
 #include "ourmama.pb.h"
-#include <arpa/inet.h>
 #include <boost/filesystem.hpp>
 #include <chrono>
 #include <condition_variable>
-#include <cstdlib>
-#include <ctime>
-#include <deque>
-#include <dlfcn.h>
 #include <etcd/Client.hpp>
 #include <etcd/Response.hpp>
 #include <etcd/Watcher.hpp>
@@ -18,18 +13,12 @@
 #include <fmt/core.h> // fmtlib is neater and faster than boost::format
 #include <grpcpp/grpcpp.h>
 #include <hdfs/hdfs.h>
-#include <ifaddrs.h>
-#include <iostream>
 #include <memory>
 #include <mutex>
-#include <netinet/in.h>
-#include <optional>
 #include <queue>
 #include <shared_mutex>
 #include <string>
-#include <sys/socket.h>
 #include <thread>
-#include <unistd.h>
 #include <unordered_map>
 
 #define BOOST_LOG_DYN_LINK 1
@@ -40,17 +29,15 @@ namespace logging = boost::log;
 
 using MamaRequest = alimama::proto::Request;
 using MamaResponse = alimama::proto::Response;
-using SliceRequest = alimama::proto::SliceRequest;
 using alimama::proto::ModelService;
-
-using IntraReq = ourmama::proto::IntraReq;
-using IntraResp = ourmama::proto::IntraResp;
+using alimama::proto::SliceRequest;
 using google::protobuf::Empty;
-using ourmama::proto::IntraService;
-using ourmama::proto::PingService;
-
 using grpc::ServerContext;
 using grpc::Status;
+using ourmama::proto::IntraReq;
+using ourmama::proto::IntraResp;
+using ourmama::proto::IntraService;
+using ourmama::proto::PingService;
 
 using RawBuffer = char *;
 
@@ -61,36 +48,23 @@ constexpr size_t KB = 1024;
 constexpr size_t MB = 1024 * KB;
 constexpr size_t GB = 1024 * MB;
 
-constexpr int queryInterval = 1000; // milliseconds
-constexpr int pingPort = 50049;
-constexpr int intraPort = 50050;
+constexpr uint16_t cPingPort = 50049;
+constexpr uint16_t cIntraPort = 50050;
+constexpr uint16_t cPublicPort = 50051;
+constexpr int cQueryInterval = 1000; // milliseconds
 
 const std::string etcdUrl = "http://etcd:2379";
 const std::string etcdIntraDiscoveryFmt = "/intra/{}";
-const std::string etcdVersionSyncNodeFmt = "/version-{}/{}";
+const std::string etcdVersionSyncFmt = "/version-{}/{}";
 
 bool gIsExiting = false;
 int gNodeId;
 int gNodeNum;
 int gSliceCount, gAvgSlice, gQuotient;
-std::string gNodeIp;
-std::vector<std::string> gNodeIps;
 
 void SleepMilli(int ms) {
   std::this_thread::sleep_for(std::chrono::milliseconds(ms));
 }
-
-#ifdef LOWQPS
-std::atomic<int> tokenId;
-std::atomic<int> grantId;
-void RateLimiter() {
-  while (!gIsExiting) {
-    if (tokenId <= grantId + 20)
-      ++tokenId;
-    std::this_thread::sleep_for(std::chrono::microseconds(2000));
-  }
-}
-#endif
 
 // trim from end
 static inline std::string rtrim(std::string s) {
@@ -102,7 +76,7 @@ static inline std::string rtrim(std::string s) {
 }
 
 namespace EtcdService {
-#define LAUNCH_ETCD_TASK(keyStr, opStr)                                        \
+#define SIMPLE_ETCD_OP(opStr, keyStr)                                          \
   try {                                                                        \
     etcd::Response response = task.get();                                      \
     BOOST_LOG_TRIVIAL(info) << "[etcd] " << opStr << " " << (keyStr)           \
@@ -115,23 +89,23 @@ namespace EtcdService {
 void set(std::string key, std::string value) {
   etcd::Client client(etcdUrl);
   auto task = client.set(key, value);
-  LAUNCH_ETCD_TASK(key, "set");
+  SIMPLE_ETCD_OP("set", key);
 }
 
 void rm(std::string key) {
   etcd::Client client(etcdUrl);
   auto task = client.rm(key);
-  LAUNCH_ETCD_TASK(key, "rm");
+  SIMPLE_ETCD_OP("rm", key);
 }
 
-#undef LAUNCH_ETCD_TASK
+#undef SIMPLE_ETCD_OP
 
 void RegisterIntra() {
   etcd::Client client(etcdUrl);
   while (true) {
     try {
       auto response = client
-                          .set(fmt::format(etcdIntraDiscoveryFmt, gNodeIp),
+                          .set(fmt::format(etcdIntraDiscoveryFmt, gNodeId),
                                std::getenv("NODE_ID"))
                           .get();
       if (response.is_ok()) {
@@ -141,48 +115,40 @@ void RegisterIntra() {
         BOOST_LOG_TRIVIAL(warning)
             << "RegisterIntra: failed; reason: " << response.error_message()
             << "; retrying...";
-        SleepMilli(queryInterval);
+        SleepMilli(cQueryInterval);
       }
     } catch (const std::exception &e) {
       BOOST_LOG_TRIVIAL(error) << "RegisterIntra: exception: " << e.what();
-      SleepMilli(queryInterval);
+      SleepMilli(cQueryInterval);
     }
   }
 }
 
-void GetAllNodesIp() {
+void WaitForAllNodesToStart() {
   etcd::Client client(etcdUrl);
-  gNodeIps.resize(gNodeNum);
 
   while (true) {
     try {
       auto response = client.ls("/intra/").get();
       if (response.is_ok()) {
-        if (response.keys().size() != gNodeNum) {
-          BOOST_LOG_TRIVIAL(info)
-              << "GetAllNodesIp: only " << response.keys().size()
-              << " nodes are discovered, retrying...";
-          SleepMilli(queryInterval);
-          continue;
-        }
+        if (response.keys().size() == gNodeNum)
+          return;
 
-        for (auto &key : response.keys()) {
-          auto ipAddr = key.substr(key.find_last_of('/') + 1);
-          // TODO: add error handling
-          auto nodeId = std::stoi(client.get(key).get().value().as_string());
-          gNodeIps[nodeId - 1] = std::move(ipAddr);
-        }
-        return;
-
+        BOOST_LOG_TRIVIAL(info)
+            << "WaitForAllNodesToStart: only " << response.keys().size()
+            << " nodes are started, retrying...";
+        SleepMilli(cQueryInterval);
+        continue;
       } else {
         BOOST_LOG_TRIVIAL(warning)
-            << "GetAllNodesIp failed: " << response.error_code() << " "
+            << "WaitForAllNodesToStart failed: " << response.error_code() << " "
             << response.error_message();
-        SleepMilli(queryInterval);
+        SleepMilli(cQueryInterval);
       }
     } catch (const std::exception &e) {
       BOOST_LOG_TRIVIAL(error)
-          << "An exception occurred during GetAllNodesIp: " << e.what();
+          << "An exception occurred during WaitForAllNodesToStart: "
+          << e.what();
       return;
     }
   }
@@ -190,20 +156,20 @@ void GetAllNodesIp() {
 
 static void RegisterAllModelServices() {
   for (int i = 1; i <= gNodeNum; ++i)
-    set(fmt::format("/services/modelservice/node-{}:50051", i), "");
+    set(fmt::format("/services/modelservice/node-{}:{}", i, cPublicPort), "");
 }
 
 static void RegisterVersion(int gen) {
-  set(fmt::format(etcdVersionSyncNodeFmt, gen, gNodeId), "");
+  set(fmt::format(etcdVersionSyncFmt, gen, gNodeId), "");
 }
 
 static void UnregisterVersion(int gen) {
-  rm(fmt::format(etcdVersionSyncNodeFmt, gen, gNodeId));
+  rm(fmt::format(etcdVersionSyncFmt, gen, gNodeId));
 }
 } // namespace EtcdService
 
 std::atomic<int> gSyncCnt = 0;
-etcd::Watcher *pWatcher = nullptr;
+etcd::Watcher *gpWatcher_ = nullptr;
 
 class SliceCache {
 private:
@@ -249,12 +215,12 @@ public:
   /**
    * Must be called before `SliceCache::Load`.
    */
-  static void ScheduleSync(int gen) {
-    BOOST_LOG_TRIVIAL(info) << "ScheduleSync gen: " << gen;
+  static void WatchFor(int gen) {
+    BOOST_LOG_TRIVIAL(info) << "WatchFor gen: " << gen;
 
-    auto start = fmt::format(etcdVersionSyncNodeFmt, gen, 0);
-    auto end = fmt::format(etcdVersionSyncNodeFmt, gen, gNodeNum);
-    pWatcher = new etcd::Watcher(etcdUrl, start, end, WatcherCb);
+    auto start = fmt::format(etcdVersionSyncFmt, gen, 0);
+    auto end = fmt::format(etcdVersionSyncFmt, gen, gNodeNum);
+    gpWatcher_ = new etcd::Watcher(etcdUrl, start, end, WatcherCb);
   }
 
   static std::shared_ptr<SliceCache> Get() {
@@ -293,8 +259,8 @@ public:
     }
 
     BOOST_LOG_TRIVIAL(info) << "SliceCache::Load: everyone is ready";
-    delete pWatcher;
-    ScheduleSync(newCache->GenId_ + 1);
+    delete gpWatcher_;
+    WatchFor(newCache->GenId_ + 1);
 
     {
       std::unique_lock lock(mutP_);
@@ -317,45 +283,20 @@ public:
   }
 }; // class SliceCache
 
-std::string GetIpAddr() {
-  struct ifaddrs *addresses;
-  if (getifaddrs(&addresses) == -1) {
-    return "";
-  }
-
-  std::string ipAddr;
-  for (struct ifaddrs *addr = addresses; addr != nullptr;
-       addr = addr->ifa_next) {
-    if (addr->ifa_addr == nullptr || addr->ifa_addr->sa_family != AF_INET)
-      continue;
-
-    const struct sockaddr_in *sockaddr =
-        reinterpret_cast<const struct sockaddr_in *>(addr->ifa_addr);
-    ipAddr = inet_ntoa(sockaddr->sin_addr);
-    if (strcmp(ipAddr.c_str(), "127.0.0.1") == 0)
-      continue;
-
-    break;
-  }
-
-  freeifaddrs(addresses);
-  return ipAddr;
-}
-
 class IntraRespDataManager {
 private:
   static constexpr size_t MAX_RING_SIZE = 0x6000;
 
-  std::atomic<size_t> id_ = 0;
+  std::atomic<uint32_t> id_ = 0;
 
   IntraRespDataManager() = default;
   IntraRespDataManager(const IntraRespDataManager &) = delete;
   IntraRespDataManager &operator=(const IntraRespDataManager &) = delete;
 
   struct Record {
+    uint8_t remains;
     MamaResponse *pMessage;
     std::condition_variable cv;
-    std::atomic<uint8_t> remains;
     std::shared_mutex mutex;
   } records_[MAX_RING_SIZE];
 
@@ -365,16 +306,16 @@ public:
     return instance;
   }
 
-  size_t GetId() { return id_++; }
+  uint32_t GetId() { return id_++; }
 
-  MamaResponse *GetMessage(size_t id) {
+  MamaResponse *GetMessage(uint32_t id) {
     return records_[id % MAX_RING_SIZE].pMessage;
   }
 
-  std::pair<size_t, std::condition_variable *> Register(MamaResponse *pMessage,
-                                                        uint8_t remains) {
-    size_t id = id_++;
-    size_t ringId = id % MAX_RING_SIZE;
+  std::pair<uint32_t, std::condition_variable *>
+  Register(MamaResponse *pMessage, uint8_t remains) {
+    uint32_t id = id_++;
+    uint32_t ringId = id % MAX_RING_SIZE;
     auto &record = records_[ringId];
     record.mutex.lock();
 
@@ -385,8 +326,8 @@ public:
     return {id, &record.cv};
   }
 
-  bool IsBatchFinished(size_t id) {
-    size_t ringId = id % MAX_RING_SIZE;
+  bool IsBatchFinished(uint32_t id) {
+    uint32_t ringId = id % MAX_RING_SIZE;
     auto &record = records_[ringId];
     record.mutex.lock_shared();
 
@@ -396,8 +337,8 @@ public:
     return ret;
   }
 
-  void ReportFinishedResponseFor(size_t id) {
-    size_t ringId = id % MAX_RING_SIZE;
+  void ReportFinishedResponseFor(uint32_t id) {
+    uint32_t ringId = id % MAX_RING_SIZE;
     auto &record = records_[ringId];
     record.mutex.lock();
 
@@ -416,11 +357,10 @@ public:
       : stub_(PingService::NewStub(channel)) {}
 
   void Ping() {
-    static auto _empty = Empty();
+    static Empty _emptyReq, _emptyResp;
 
     grpc::ClientContext context;
-    Empty _pemp;
-    Status status = stub_->Ping(&context, _empty, &_pemp);
+    Status status = stub_->Ping(&context, _emptyReq, &_emptyResp);
     if (!status.ok())
       BOOST_LOG_TRIVIAL(error)
           << "PingServiceClient::Ping: " << status.error_message();
@@ -447,13 +387,13 @@ public:
   }
 
   void Run() {
-    const auto addr = fmt::format("0.0.0.0:{}", pingPort);
+    const auto addr = fmt::format("0.0.0.0:{}", cPingPort);
 
     grpc::ServerBuilder grpcServerBuilder;
     grpcServerBuilder.AddListeningPort(addr, grpc::InsecureServerCredentials());
     grpcServerBuilder.RegisterService(this);
     std::unique_ptr<grpc::Server> server(grpcServerBuilder.BuildAndStart());
-    BOOST_LOG_TRIVIAL(info) << "Server listening on " << addr;
+    BOOST_LOG_TRIVIAL(info) << "Ping server listening on " << addr;
 
     server->Wait();
   }
@@ -499,10 +439,10 @@ public:
       AsyncClientCall *call = static_cast<AsyncClientCall *>(tag);
       auto &intraResp = call->reply;
 
-      auto pMessage = respman.GetMessage(intraResp.id());
+      const auto id = intraResp.id();
+      auto pMessage = respman.GetMessage(id);
       if (unlikely(!pMessage))
-        BOOST_LOG_TRIVIAL(error)
-            << "pMessage is nullptr for " << intraResp.id();
+        BOOST_LOG_TRIVIAL(error) << "pMessage is nullptr for " << id;
 
       const int N = intraResp.data().size();
       for (int i = 0; i < N; ++i) {
@@ -512,7 +452,7 @@ public:
             pMessage->mutable_slice_data(intraResp.offset(i))->data();
         memcpy(copyTo, copyFrom, slice.size());
       }
-      respman.ReportFinishedResponseFor(intraResp.id());
+      respman.ReportFinishedResponseFor(id);
 
       delete call;
     }
@@ -531,14 +471,9 @@ void EstablishIntraConn() {
   for (int i = 0; i < gNodeNum; ++i) {
     if (i != gNodeId)
       gIntraClients[i] = new IntraServiceClient(
-          grpc::CreateChannel(fmt::format("node-{}:{}", i + 1, intraPort),
+          grpc::CreateChannel(fmt::format("node-{}:{}", i + 1, cIntraPort),
                               grpc::InsecureChannelCredentials()));
   }
-}
-
-void LocalRead(std::shared_ptr<SliceCache> pSc, uint64_t slice, uint64_t seek,
-               uint64_t len, RawBuffer buffer) {
-  pSc->Read(slice, seek, len, buffer);
 }
 
 class IntraServiceImpl final {
@@ -579,7 +514,7 @@ private:
         auto d = reply->add_data();
         d->resize(len);
 
-        LocalRead(pCache, slice, seek, len, d->data());
+        pCache->Read(slice, seek, len, d->data());
       }
 
       reply->set_id(request.id());
@@ -606,7 +541,7 @@ private:
     }
   }; // class CallData
 
-  std::vector<std::thread> threads_;
+  std::thread rpcThread_;
 
 public:
   void HandleRPCs() {
@@ -624,8 +559,7 @@ public:
   }
 
   ~IntraServiceImpl() {
-    for (auto &thread : threads_)
-      thread.detach();
+    rpcThread_.detach();
     server_->Shutdown();
     cq_->Shutdown();
   }
@@ -640,38 +574,29 @@ public:
     server_ = builder.BuildAndStart();
     BOOST_LOG_TRIVIAL(info) << "Server listening on " << addr;
 
-    // constexpr int nThreads = 6;
-    constexpr int nThreads = 1;
-    for (int i = 0; i < nThreads; ++i)
-      threads_.emplace_back(&IntraServiceImpl::HandleRPCs, this);
+    rpcThread_ = std::thread(&IntraServiceImpl::HandleRPCs, this);
   }
 }; // class IntraServiceImpl
 
-std::pair<int, int> GetSliceRange(int nodeId) {
+__attribute__((hot)) std::pair<int, int> GetSliceRange(int nodeId) {
   int start = gAvgSlice * nodeId + std::min(nodeId, gQuotient);
   return {start, start + gAvgSlice + (nodeId < gQuotient ? 1 : 0) - 1};
 }
 
 class VersionSystem {
 private:
-  class VersionTracker {
-    std::unordered_set<std::string> record_;
-    VersionTracker() = default;
+  inline static std::unordered_set<std::string> record_;
 
-  public:
-    bool IsDownloaded(std::string version) {
-      return record_.count(version) > 0;
-    }
+  static bool isVersionDownloaded(std::string version) {
+    return record_.count(version) > 0;
+  }
 
-    void SetDownloaded(std::string version) { record_.insert(version); }
+  static void setVersionDownloaded(std::string version) {
+    record_.insert(version);
+  }
 
-    static VersionTracker &GetInstance() {
-      static VersionTracker instance;
-      return instance;
-    }
-  }; // class VersionTracker
-
-  int getVersionSliceCountFromHdfs(hdfsFS &fs, std::string modelVersion) {
+  static int getVersionSliceCountFromHdfs(hdfsFS &fs,
+                                          std::string modelVersion) {
     int numEntries = 0;
     std::string path = fmt::format("/model_{}/", modelVersion);
 
@@ -698,6 +623,8 @@ private:
   }
 
   VersionSystem() = default;
+  VersionSystem(const VersionSystem &) = delete;
+  VersionSystem &operator=(const VersionSystem &) = delete;
 
 public:
   std::string CurrentVersion_ = "WAIT";
@@ -743,7 +670,7 @@ public:
         // Starting with model_ means it could be valid version.
         // check if the model.done file exists, if not exists, we need wait
         // until model load to hdfs finished.
-        auto modelDonePath = fmt::format("/{}/model.done", filename);
+        const auto modelDonePath = fmt::format("/{}/model.done", filename);
         if (hdfsGetPathInfo(fs, modelDonePath.c_str()) == NULL)
           continue;
 
@@ -764,7 +691,6 @@ public:
 
   void downloadVersionFrom(hdfsFS &fs, std::string version, int start,
                            int end) {
-
     BOOST_LOG_TRIVIAL(info) << "  Downloading version " << version;
     BOOST_LOG_TRIVIAL(info)
         << "  planned download: [" << start << ", " << end << "]";
@@ -780,7 +706,7 @@ public:
     }
     hdfsDisconnect(localFs);
 
-    VersionTracker::GetInstance().SetDownloaded(version);
+    setVersionDownloaded(version);
   }
 
   /**
@@ -790,7 +716,6 @@ public:
   void LoadVersionsOnDemand(hdfsFS &fs,
                             const std::vector<std::string> &versions,
                             bool shouldPreload = false) {
-    auto versionTracker = VersionTracker::GetInstance();
     auto targetVer = versions[0];
     if (!gSliceCount) {
       gSliceCount = getVersionSliceCountFromHdfs(fs, targetVer);
@@ -805,9 +730,8 @@ public:
     /// 1. check if the version is already downloaded to local disk
     BOOST_LOG_TRIVIAL(info)
         << "[1] checking if version " << targetVer << " is on disk";
-    if (versionTracker.IsDownloaded(targetVer)) {
+    if (isVersionDownloaded(targetVer))
       goto memload;
-    }
 
     /// 2. the normal slow path
     BOOST_LOG_TRIVIAL(info)
@@ -842,7 +766,7 @@ public:
       }
 
       auto versions = LatestVersionOn(fs);
-      auto newVersion = versions[0];
+      const auto newVersion = versions[0];
       if (newVersion != "WAIT" && CurrentVersion_ != newVersion) {
         BOOST_LOG_TRIVIAL(info) << "Current version: " << CurrentVersion_
                                 << ", new version: " << newVersion;
@@ -908,7 +832,7 @@ private:
       if (serverNodeId == gNodeId) {
         // From what it appears on benchmarks, it looks like synchronous reading
         // is enough right now
-        LocalRead(pCache, slice, seek, len, buffer);
+        pCache->Read(slice, seek, len, buffer);
       } else {
         auto &nodeReq = reqsForNode[serverNodeId];
         if (nodeReq.slice_req_size() == 0)
@@ -944,19 +868,13 @@ private:
 public:
   Status Get(ServerContext *context, const MamaRequest *request,
              MamaResponse *reply) override {
-#ifdef LOWQPS
-    int localGrantId = grantId++;
-    while (localGrantId > tokenId) {
-      /* loop indefinitely */
-    }
-#endif
     progress(request, reply);
     return Status::OK;
   }
 }; // class ModelServiceImpl
 
 static void RunPublicGrpc() {
-  std::string serverAddr("0.0.0.0:50051");
+  std::string serverAddr(fmt::format("0.0.0.0:{}", cPublicPort));
   ModelServiceImpl service;
 
   grpc::ServerBuilder grpcServerBuilder;
@@ -975,58 +893,36 @@ int ParseIntEnv(const char *envName) {
   return std::stoi(envStr);
 }
 
-/**
- * @brief Since we don't have a proper way to end this program, we need a way to
- * handle exits gracefully, so that `gprof` can generate the profiling data.
- * Excerpted from StackOverflow.
- */
-void sigUsr1Handler(int sig) {
-  BOOST_LOG_TRIVIAL(info) << "Exiting on SIGUSR1";
-  void (*_mcleanup)(void);
-  _mcleanup = (void (*)(void))dlsym(RTLD_DEFAULT, "_mcleanup");
-  if (_mcleanup == NULL)
-    BOOST_LOG_TRIVIAL(info) << "Unable to find gprof exit hook";
-  else
-    _mcleanup();
-  _exit(0);
-}
-
 int main(int argc, char **argv) {
-  signal(SIGUSR1, sigUsr1Handler);
   logging::core::get()->set_filter(logging::trivial::severity >=
                                    logging::trivial::info);
 
   gNodeId = ParseIntEnv("NODE_ID") - 1;
   gNodeNum = ParseIntEnv("NODE_NUM");
-  gNodeIp = GetIpAddr();
+
+  SliceCache::WatchFor(1);
 
   IntraServiceImpl intraServer;
-  intraServer.Run(intraPort); // Don't have to call the destructor explicitly
+  intraServer.Run(cIntraPort); // Don't have to call the destructor explicitly
   EtcdService::RegisterIntra();
-  EtcdService::GetAllNodesIp(); // synchronous
+  EtcdService::WaitForAllNodesToStart(); // synchronous
   EstablishIntraConn();
 
   std::vector<std::thread> threads;
   PingServiceImpl pingServer;
   threads.emplace_back(&PingServiceImpl::Run, &pingServer);
 
-  int nextInRing =
+  int pingPeerId =
       1 + gNodeId + gNodeNum / 2 * (gNodeId < gNodeNum / 2 ? 1 : -1);
   pPingClient = new PingServiceClient(
-      grpc::CreateChannel(fmt::format("node-{}:{}", nextInRing, pingPort),
+      grpc::CreateChannel(fmt::format("node-{}:{}", pingPeerId, cPingPort),
                           grpc::InsecureChannelCredentials()));
-  SliceCache::ScheduleSync(1);
 
   threads.emplace_back(&VersionSystem::Run, VersionSystem::GetInstance());
   threads.emplace_back(&RunPublicGrpc);
 
-#ifdef LOWQPS
-  threads.emplace_back(&RateLimiter);
-#endif
-
   for (auto &thread : threads)
     thread.join();
-
   delete pPingClient;
 
   return 0;

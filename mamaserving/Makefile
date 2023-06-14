@@ -2,7 +2,7 @@ HADDOP_VERSION = 3.3.1
 HADOOP_HOME = /opt/hadoop-$(HADOOP_VERSION)
 CPPFLAGS += `pkg-config --cflags protobuf grpc`
 CXXFLAGS += -std=c++17
-CXXFLAGS += -Ofast -I./include #-pg
+CXXFLAGS += -Ofast -I./include -march=native #-pg
 CXX = g++
 
 #LDFLAGS += -pg
