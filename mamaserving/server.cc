@@ -14,6 +14,7 @@
 #include <etcd/Client.hpp>
 #include <etcd/Response.hpp>
 #include <etcd/Watcher.hpp>
+#include <filesystem>
 #include <fmt/core.h> // fmtlib is neater and faster than boost::format
 #include <grpcpp/grpcpp.h>
 #include <hdfs/hdfs.h>
@@ -60,7 +61,7 @@ constexpr size_t KB = 1024;
 constexpr size_t MB = 1024 * KB;
 constexpr size_t GB = 1024 * MB;
 
-constexpr int queryInterval = 2500; // milliseconds
+constexpr int queryInterval = 1000; // milliseconds
 constexpr int pingPort = 50049;
 constexpr int intraPort = 50050;
 
@@ -207,7 +208,7 @@ etcd::Watcher *pWatcher = nullptr;
 class SliceCache {
 private:
   std::string targetPath(int slice) {
-    return fmt::format("./model_{}/model_slice.{:03d}", Version_, slice);
+    return fmt::format("/tmp/model_{}/model_slice.{:03d}", Version_, slice);
   }
 
   int start_;
@@ -249,6 +250,8 @@ public:
    * Must be called before `SliceCache::Load`.
    */
   static void ScheduleSync(int gen) {
+    BOOST_LOG_TRIVIAL(info) << "ScheduleSync gen: " << gen;
+
     auto start = fmt::format(etcdVersionSyncNodeFmt, gen, 0);
     auto end = fmt::format(etcdVersionSyncNodeFmt, gen, gNodeNum);
     pWatcher = new etcd::Watcher(etcdUrl, start, end, WatcherCb);
@@ -761,22 +764,21 @@ public:
 
   void downloadVersionFrom(hdfsFS &fs, std::string version, int start,
                            int end) {
-    std::string command = fmt::format("mkdir -p ./model_{}", version);
-    BOOST_LOG_TRIVIAL(info) << "  dispatching: " << command;
-    system(command.c_str());
 
     BOOST_LOG_TRIVIAL(info) << "  Downloading version " << version;
     BOOST_LOG_TRIVIAL(info)
         << "  planned download: [" << start << ", " << end << "]";
+    hdfsFS localFs = hdfsConnect("file://localhost/", 0);
+    std::filesystem::create_directory(fmt::format("/tmp/model_{}", version));
     for (int i = start; i <= end; ++i) {
-      command =
-          fmt::format("/opt/hadoop-3.3.1/bin/hadoop fs -get "
-                      "hdfs://namenode:9000/model_{0}/model_slice.{1:03d} "
-                      "./model_{0}/model_slice.{1:03d}",
-                      version, i);
-      BOOST_LOG_TRIVIAL(info) << "  dispatching: " << command;
-      system(command.c_str());
+      BOOST_LOG_TRIVIAL(info) << "  Downloading slice " << i;
+      hdfsCopy(
+          fs, fmt::format("/model_{0}/model_slice.{1:03d}", version, i).c_str(),
+          localFs,
+          fmt::format("/tmp/model_{0}/model_slice.{1:03d}", version, i)
+              .c_str());
     }
+    hdfsDisconnect(localFs);
 
     VersionTracker::GetInstance().SetDownloaded(version);
   }
