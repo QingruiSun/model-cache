@@ -6,6 +6,7 @@
 #include <boost/filesystem.hpp>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <etcd/Client.hpp>
 #include <etcd/Response.hpp>
 #include <etcd/Watcher.hpp>
@@ -64,15 +65,6 @@ int gSliceCount, gAvgSlice, gQuotient;
 
 void SleepMilli(int ms) {
   std::this_thread::sleep_for(std::chrono::milliseconds(ms));
-}
-
-// trim from end
-static inline std::string rtrim(std::string s) {
-  s.erase(std::find_if(s.rbegin(), s.rend(),
-                       [](unsigned char ch) { return !std::isspace(ch); })
-              .base(),
-          s.end());
-  return s;
 }
 
 namespace EtcdService {
@@ -159,11 +151,11 @@ static void RegisterAllModelServices() {
     set(fmt::format("/services/modelservice/node-{}:{}", i, cPublicPort), "");
 }
 
-static void RegisterVersion(int gen) {
+static void RegisterVersion(uint32_t gen) {
   set(fmt::format(etcdVersionSyncFmt, gen, gNodeId), "");
 }
 
-static void UnregisterVersion(int gen) {
+static void UnregisterVersion(uint32_t gen) {
   rm(fmt::format(etcdVersionSyncFmt, gen, gNodeId));
 }
 } // namespace EtcdService
@@ -196,10 +188,10 @@ private:
   }
 
   void unload() {
-    for (auto reader : readers_) {
-      reader->Unload();
-      delete reader;
-    }
+    // for (auto reader : readers_) {
+    //   reader->Unload();
+    //   delete reader;
+    // }
   }
 
 public:
@@ -215,7 +207,7 @@ public:
   /**
    * Must be called before `SliceCache::Load`.
    */
-  static void WatchFor(int gen) {
+  static void WatchFor(uint32_t gen) {
     BOOST_LOG_TRIVIAL(info) << "WatchFor gen: " << gen;
 
     auto start = fmt::format(etcdVersionSyncFmt, gen, 0);
@@ -244,10 +236,18 @@ public:
         std::make_shared<SliceCache>(version, genId, start, cnt);
     newCache->load();
 
+    BOOST_LOG_TRIVIAL(info) << "1.5: Trying to free old cache";
+    {
+      std::unique_lock lock(mutP_);
+      if (caches_.size() == 2)
+        caches_.pop();
+    }
+
     return newCache;
   }
 
   static void MakeVisible(std::shared_ptr<SliceCache> newCache) {
+
     BOOST_LOG_TRIVIAL(info) << "2. Tell everyone else I'm ready to switch";
     EtcdService::RegisterVersion(newCache->GenId_);
 
@@ -264,8 +264,6 @@ public:
 
     {
       std::unique_lock lock(mutP_);
-      if (caches_.size() == 2)
-        caches_.pop();
       caches_.push(newCache);
     }
   }
@@ -285,7 +283,7 @@ public:
 
 class IntraRespDataManager {
 private:
-  static constexpr size_t MAX_RING_SIZE = 0x6000;
+  static constexpr size_t MAX_RING_SIZE = 0x8000; // exactly 2 MB
 
   std::atomic<uint32_t> id_ = 0;
 
@@ -294,10 +292,9 @@ private:
   IntraRespDataManager &operator=(const IntraRespDataManager &) = delete;
 
   struct Record {
-    uint8_t remains;
+    std::atomic<uint32_t> remains;
     MamaResponse *pMessage;
     std::condition_variable cv;
-    std::shared_mutex mutex;
   } records_[MAX_RING_SIZE];
 
 public:
@@ -306,46 +303,31 @@ public:
     return instance;
   }
 
-  uint32_t GetId() { return id_++; }
-
   MamaResponse *GetMessage(uint32_t id) {
     return records_[id % MAX_RING_SIZE].pMessage;
   }
 
   std::pair<uint32_t, std::condition_variable *>
-  Register(MamaResponse *pMessage, uint8_t remains) {
+  Register(MamaResponse *pMessage, uint32_t remains) {
     uint32_t id = id_++;
     uint32_t ringId = id % MAX_RING_SIZE;
     auto &record = records_[ringId];
-    record.mutex.lock();
-
     record.pMessage = pMessage;
     record.remains = remains;
-
-    record.mutex.unlock();
     return {id, &record.cv};
   }
 
   bool IsBatchFinished(uint32_t id) {
     uint32_t ringId = id % MAX_RING_SIZE;
     auto &record = records_[ringId];
-    record.mutex.lock_shared();
-
     bool ret = record.remains == 0;
-
-    record.mutex.unlock_shared();
     return ret;
   }
 
   void ReportFinishedResponseFor(uint32_t id) {
     uint32_t ringId = id % MAX_RING_SIZE;
     auto &record = records_[ringId];
-    record.mutex.lock();
-
     bool finished = (--record.remains) == 0;
-
-    record.mutex.unlock();
-
     if (finished)
       record.cv.notify_one();
   }
@@ -450,7 +432,7 @@ public:
         const char *copyFrom = slice.data();
         char *copyTo =
             pMessage->mutable_slice_data(intraResp.offset(i))->data();
-        memcpy(copyTo, copyFrom, slice.size());
+        std::copy(copyFrom, copyFrom + slice.size(), copyTo);
       }
       respman.ReportFinishedResponseFor(id);
 
@@ -615,8 +597,9 @@ private:
                  bool shouldPing) {
     BOOST_LOG_TRIVIAL(info) << "  Preparing new cache";
     auto newCache = SliceCache::Load(version, genId, start, cnt);
-    if (shouldPing) {
+    if (shouldPing && pPingClient) {
       BOOST_LOG_TRIVIAL(info) << "  Pinging next in line";
+      SleepMilli(rand() % 1000);
       pPingClient->Ping();
     }
     SliceCache::MakeVisible(newCache);
@@ -636,7 +619,7 @@ public:
   }
 
   std::vector<std::string> LatestVersionOn(hdfsFS &fs) {
-    constexpr size_t versionBufferSize = 128;
+    constexpr size_t versionBufferSize = 32;
 
     int numEntries;
     std::string order;
@@ -654,17 +637,16 @@ public:
       std::string filename = path.filename().string();
 
       if (filename == "rollback.version") {
-        char buffer[versionBufferSize];
+        std::string buffer;
+        buffer.resize(versionBufferSize);
 
         hdfsFile rbFile =
             hdfsOpenFile(fs, fileInfo[i].mName, O_RDONLY, 0, 0, 0);
-        hdfsRead(fs, rbFile, buffer, versionBufferSize);
+        hdfsRead(fs, rbFile, buffer.data(), versionBufferSize);
         hdfsCloseFile(fs, rbFile);
 
-        order = std::string(buffer).substr(
-            6, std::string("YYYY_MM_DD_HH_mm_SS").size());
-        // BOOST_LOG_TRIVIAL(info)  << "rollback.version == " << order <<
-        // std::endl;
+        // std::string("YYYY_MM_DD_HH_mm_SS").size() == 19
+        order = buffer.substr(6, 19);
         goto cleanup;
       } else if (filename.find("model_") == 0) {
         // Starting with model_ means it could be valid version.
@@ -674,14 +656,14 @@ public:
         if (hdfsGetPathInfo(fs, modelDonePath.c_str()) == NULL)
           continue;
 
-        dirs.push_back(filename.substr(6)); // removing the 'model_' in front
+        dirs.push_back(
+            filename.substr(6, 19)); // removing the 'model_' in front
       }
     }
 
     sort(dirs.rbegin(), dirs.rend());
-    if (dirs.empty()) {
+    if (dirs.empty())
       order = "WAIT"; // this situation may occur when start.
-    }
 
   cleanup:
     if (likely(fileInfo != nullptr && numEntries > 0))
@@ -759,7 +741,7 @@ public:
 
     while (!gIsExiting) {
       bool isFirstLoad = CurrentVersion_ == "WAIT";
-      if (!isFirstLoad && gNodeId >= gNodeNum / 2) {
+      if (!isFirstLoad && gNodeId > 3) {
         std::mutex mut;
         std::unique_lock lk(mut);
         gCvPing.wait(lk, [] { return gPinged; });
@@ -785,7 +767,7 @@ public:
 
       gPinged = false;
 
-      if (gNodeId < gNodeNum / 2)
+      if (gNodeId < 4)
         SleepMilli(3000);
     }
 
@@ -815,7 +797,7 @@ private:
     const auto &sliceRequests = request->slice_request();
     auto pCache = SliceCache::Get();
 
-    int nNodesComm = 0;
+    uint32_t nNodesComm = 0;
     for (int i = 0; i < sliceRequests.size(); ++i) {
       const auto &request = sliceRequests[i];
       slice = request.slice_partition();
@@ -912,18 +894,20 @@ int main(int argc, char **argv) {
   PingServiceImpl pingServer;
   threads.emplace_back(&PingServiceImpl::Run, &pingServer);
 
-  int pingPeerId =
-      1 + gNodeId + gNodeNum / 2 * (gNodeId < gNodeNum / 2 ? 1 : -1);
-  pPingClient = new PingServiceClient(
-      grpc::CreateChannel(fmt::format("node-{}:{}", pingPeerId, cPingPort),
-                          grpc::InsecureChannelCredentials()));
+  if (gNodeId < 2) {
+    int pingPeerId = 1 + gNodeId + 4;
+    pPingClient = new PingServiceClient(
+        grpc::CreateChannel(fmt::format("node-{}:{}", pingPeerId, cPingPort),
+                            grpc::InsecureChannelCredentials()));
+  }
 
   threads.emplace_back(&VersionSystem::Run, VersionSystem::GetInstance());
   threads.emplace_back(&RunPublicGrpc);
 
   for (auto &thread : threads)
     thread.join();
-  delete pPingClient;
+  if (pPingClient)
+    delete pPingClient;
 
   return 0;
 }
